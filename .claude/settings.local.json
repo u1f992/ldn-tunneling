@@ -1,10 +1,29 @@
 {
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
   "permissions": {
     "allow": [
       "WebSearch",
       "WebFetch(domain:git.kernel.org)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:w1.fi)",
+      "WebFetch(domain:git.w1.fi)",
+      "WebFetch(domain:www.the-sz.com)",
+      "WebFetch(domain:deviceinbox.com)",
+      "WebFetch(domain:devicehunt.com)",
+      "WebFetch(domain:cateee.net)",
+      "WebFetch(domain:bbs.kakaku.com)",
+      "WebFetch(domain:wikidevi.wi-cat.ru)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(cd /tmp/tmp.1Um2wTlDd2/linux && git sparse-checkout add net/mac80211 2>&1)",
+      "Bash(/home/mukai/Documents/ldn-tunneling/.venv/bin/pip show:*)",
+      "Bash(/home/mukai/Documents/ldn-tunneling/.venv/bin/python:*)",
+      "Bash(tail:*)",
+      "Bash(cd:*)"
     ]
   }
 }

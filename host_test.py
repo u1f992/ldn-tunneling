@@ -22,7 +22,7 @@ async def capture_network_params(keys):
         print(f"Scan attempt {attempt + 1}/10...", end=" ", flush=True)
         networks = await ldn.scan(
             keys=keys,
-            phyname="phy1",
+            phyname="phy8",
             ifname="ldn",
             channels=[1, 6, 11],
             dwell_time=0.130,
@@ -76,8 +76,9 @@ async def main():
     print("=== Phase 3: Hosting LDN network ===")
     param = ldn.CreateNetworkParam()
     param.keys = keys
-    param.phyname = "phy1"
-    param.phyname_monitor = "phy1"
+    param.ifname = "wlx94a67e5d7030"
+    param.phyname = "phy8"
+    param.phyname_monitor = "phy8"
     param.local_communication_id = info.local_communication_id
     param.scene_id = info.scene_id
     param.max_participants = info.max_participants
