@@ -245,8 +245,10 @@ v3 では Switch A がホスト (部屋作成者) のまま、PC は透過的リ
 - [x] 構文チェック・CLI help 確認
 - [x] 単拠点テスト (--solo) ★成功
 - [x] 2拠点接続テスト ★ロビー参加確認
-- [ ] Pia 接続問題対応
-- [ ] 再起動手順の改善
+- [x] 再起動手順の改善 (while True accept ループ)
+- [x] Pia 接続問題分析 → routing+NAT 設計
+- [x] routing+NAT 実装 (tunnel_node.py)
+- [ ] 2拠点テスト: routing+NAT で Pia 通信成立確認
 
 #### v3 実装詳細 (tunnel_node.py)
 
@@ -313,9 +315,98 @@ v3 では Switch A がホスト (部屋作成者) のまま、PC は透過的リ
 - セカンダリの NM 管理外設定: `/etc/NetworkManager/conf.d/99-ldn-unmanaged.conf` に
   `interface-name:wlx*;interface-name:ldn` を設定済み
 
-**既知のリスク (未検証):**
-- Switch A の Pia が Switch B を認識しない可能性
-  - Switch A の participant list に Switch B がいない (Primary の STANetwork は注入不可)
+**2拠点接続テスト結果:**
+- ロビー参加成功: Switch B が PC B の部屋に参加し、Switch A がホストするロビーを確認
+  - Switch B: idx=1, IP=169.254.{nid}.2, MAC=64:B5:C6:1B:14:9B
+- **Pia 通信失敗**: ゲーム開始 (対戦開始) 時に「通信相手からの応答がありませんでした」
+  - Switch B がロビーから強制退出される
+  - ロビー内の操作 (キャラ選択等) は正常 — LDN 層は機能している
+  - Pia 層 (UDP 直接通信) の確立に失敗
+
+**再接続サポート (解決済み):**
+- 問題: セカンダリ Ctrl+C 後の再起動で Connection refused
+- 原因: Primary が TCP listener を最初の accept 後に閉じていた
+- 修正: `run_primary` を `while True` accept ループに変更、listener は finally で閉じる
+- nursery cancel で前の secondary セッションを安全に終了
+
+#### Pia 通信失敗の根本原因分析
+
+**3つの問題が同時に存在:**
+
+1. **IP 衝突**: PC A (participant 1) と Switch B (participant 1 on secondary) が
+   両方 `169.254.{nid}.2` を使用。_register_participant の index 範囲が 1-7 で
+   Switch B が index 1 に入るため、Primary 側の PC A と同じ IP になる。
+
+2. **MAC 書き換え**: managed-mode STA (ldn IF) は送信時に 802.11 Address 2 を
+   自身の MAC に書き換える。bridge 経由で Switch B の MAC を持つフレームが入っても、
+   実際に Switch A が受信する 802.11 フレームの source は PC A の MAC になる。
+   → Switch A の Pia は Switch B からのパケットを識別できない。
+
+3. **Switch A が Switch B を知らない**: Switch A の participant list には PC A しかいない。
+   STANetwork は read-only であり、仮想参加者の注入は不可能。
+   Pia は participant list から通信先の IP/ポートを発見するため、
+   Switch B の情報がないと Pia セッション確立が成立しない。
+
+**解決策: routing + iptables NAT (Primary 側)**
+
+bridge + tc mirred + veth pair を全廃止し、gretap1 と ldn IF 間を
+IP routing + iptables MASQUERADE で接続する。
+
+核心アイデア: Switch B → Switch A の通信を PC A に成りすまさせる (MASQUERADE)。
+Switch A の Pia は PC A (participant 1) との通信として認識する。
+応答は conntrack の逆変換で Switch B に戻る。
+
+**新データ経路:**
+```
+Switch B → PC B (WiFi) → TAP → br-ldn → gretap1 → WireGuard
+  → PC A gretap1 (src=.3, dst=.1) → ip_forward → MASQUERADE (src→.2)
+  → ldn IF → kernel 802.11 → Switch A
+
+Switch A → ldn IF (src=.1, dst=.2) → conntrack reverse (dst→.3)
+  → ip rule table 100 → gretap1 → WireGuard
+  → PC B gretap1 → br-ldn → TAP → library broadcast → Switch B
+```
+
+**IP アドレス割り当て変更:**
+| 参加者 | Index | IP |
+|---|---|---|
+| Switch A (ホスト) | 0 | 169.254.{nid}.1 |
+| PC A (STA) | 1 | 169.254.{nid}.2 |
+| Switch B | 2 | 169.254.{nid}.3 |
+
+**必要な変更:**
+- Primary: gretap1 standalone (bridge 不要) + ip_forward + MASQUERADE + policy routing
+- Secondary: _register_participant range 2-7 (index 1 = PC A 用に予約)
+- Secondary: TAP IP を .254 に変更 (Switch A 宛て通信を横取りしない)
+- Secondary: participant 1 (PC A) を非表示 (Switch B に PC A を見せる必要なし)
+
+#### routing+NAT 実装 (tunnel_node.py コード変更)
+
+**廃止した関数:**
+- `setup_tunnel()` → `setup_tunnel_primary()` / `setup_tunnel_secondary()` に分離
+- `teardown_tunnel()` → `teardown_primary()` / `teardown_secondary()` に分離
+- `setup_station_relay()` → 廃止 (veth pair + tc mirred redirect → 不要)
+
+**新規関数:**
+- `setup_tunnel_primary(local_ip, remote_ip)`: gretap1 のみ (bridge なし)
+- `setup_tunnel_secondary(local_ip, remote_ip)`: gretap1 + br-ldn (従来の setup_tunnel と同じ)
+- `setup_primary_routing(ifname, network_id)`: routing + NAT セットアップ
+  - gretap1 に 169.254.{nid}.2/24 を付与
+  - proxy_arp=1, ip_forward=1
+  - iptables MASQUERADE: gretap1→ldn 送信時に src を PC A IP に書き換え
+  - iptables FORWARD: gretap1 ↔ ldn 間のフォワーディング許可
+  - ip rule + ip route table 100: ldn から受信した NATed reply を gretap1 へ
+- `teardown_primary(ifname, network_id)`: 上記の逆操作
+- `teardown_secondary()`: br-ldn + gretap1 削除
+
+**変更した関数:**
+- `cleanup_stale_interfaces()`: iptables flush, ip rule/route table 100 削除を追加
+- `patch_secondary_network()`:
+  - `_register_participant` range: `range(1, 8)` → `range(2, 8)` (index 1 = PC A 用)
+  - TAP IP: `169.254.{nid}.1/24` → `169.254.{nid}.254/24` (Switch A 宛て横取り防止)
+  - participant 1 (PC A): 非表示コメント追加 (APNetwork.__init__ で participant 0 のみ設定されるため書き換え不要)
+- `run_primary()`: `setup_tunnel()` + `setup_station_relay()` → `setup_tunnel_primary()` + `setup_primary_routing()`
+- `run_secondary()`: `setup_tunnel()` → `setup_tunnel_secondary()`、`teardown_tunnel()` → `teardown_secondary()`
 
 ---
 

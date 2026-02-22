@@ -6,7 +6,8 @@ Usage:
 
 v3 非対称アーキテクチャ:
   Primary (PC A):   ldn.connect() で Switch A の LDN 部屋に STA として参加。
-                    station IF を Linux bridge 経由で GRETAP トンネルに接続。
+                    station IF と GRETAP トンネル間を routing + iptables NAT で接続。
+                    Switch B の通信を MASQUERADE で PC A に成りすませて Switch A に転送。
   Secondary (PC B): ldn.create_network() で Switch A の部屋を複製した AP をホスト。
                     participant 0 を Switch A の情報に書き換え、
                     Switch B から見て Switch A がホストに見える。
@@ -51,9 +52,23 @@ def cleanup_stale_interfaces():
     for ifname in ["ldn-tap", "relay-sta", "br-ldn", "gretap1"]:
         run_quiet(["ip", "link", "del", ifname])
     run_quiet(["tc", "qdisc", "del", "dev", "ldn", "ingress"])
+    # iptables / policy routing (Primary の routing+NAT 残骸)
+    run_quiet(["iptables", "-t", "nat", "-F", "POSTROUTING"])
+    run_quiet(["iptables", "-F", "FORWARD"])
+    run_quiet(["ip", "rule", "del", "table", "100"])
+    run_quiet(["ip", "route", "flush", "table", "100"])
 
 
-def setup_tunnel(local_ip, remote_ip):
+def setup_tunnel_primary(local_ip, remote_ip):
+    """Primary: gretap1 のみ作成 (bridge 不要、routing+NAT で接続)。"""
+    run(["ip", "link", "add", "gretap1", "type", "gretap",
+         "local", local_ip, "remote", remote_ip, "key", "1"])
+    run(["ip", "link", "set", "gretap1", "up"])
+    run(["sysctl", "-w", "net.ipv6.conf.gretap1.disable_ipv6=1"])
+
+
+def setup_tunnel_secondary(local_ip, remote_ip):
+    """Secondary: gretap1 + br-ldn bridge (TAP を bridge に接続するため)。"""
     run(["ip", "link", "add", "gretap1", "type", "gretap",
          "local", local_ip, "remote", remote_ip, "key", "1"])
     run(["ip", "link", "set", "gretap1", "up"])
@@ -64,48 +79,67 @@ def setup_tunnel(local_ip, remote_ip):
     run(["sysctl", "-w", "net.ipv6.conf.br-ldn.disable_ipv6=1"])
 
 
-def teardown_tunnel():
-    print("Cleaning up...")
-    run_quiet(["tc", "qdisc", "del", "dev", "ldn", "ingress"])
-    run_quiet(["ip", "link", "del", "relay-sta"])   # veth peer も自動削除
-    run_quiet(["ip", "link", "del", "br-ldn"])
+def setup_primary_routing(ifname, network_id):
+    """Primary: station IF と gretap1 間を routing + NAT で接続する。
+
+    MASQUERADE により、gretap1 側 (Switch B) からの通信を PC A の IP に書き換えて
+    ldn IF 経由で Switch A に転送する。Switch A は PC A からの通信として認識する。
+    応答は conntrack の逆変換で Switch B に戻る。
+
+    Policy routing (table 100) により、ldn IF で受信した LDN サブネット宛て
+    パケットを gretap1 にルーティングする (conntrack 逆変換後の応答用)。
+    """
+    nid = network_id
+
+    # gretap1 に IP を付与 (ARP 応答と routing のため)
+    run(["ip", "addr", "add", f"169.254.{nid}.2/24", "dev", "gretap1"])
+
+    # proxy_arp: gretap1 が Switch A の IP への ARP に応答
+    run(["sysctl", "-w", "net.ipv4.conf.gretap1.proxy_arp=1"])
+
+    # IP forwarding 有効化
+    run(["sysctl", "-w", "net.ipv4.ip_forward=1"])
+
+    # MASQUERADE: gretap1 → ldn 送信時に src を PC A IP に書き換え
+    run(["iptables", "-t", "nat", "-A", "POSTROUTING",
+         "-o", ifname, "-s", f"169.254.{nid}.0/24", "-j", "MASQUERADE"])
+
+    # FORWARD: gretap1 ↔ ldn 間のフォワーディング許可
+    run(["iptables", "-I", "FORWARD", "1",
+         "-i", "gretap1", "-o", ifname, "-j", "ACCEPT"])
+    run(["iptables", "-I", "FORWARD", "2",
+         "-i", ifname, "-o", "gretap1", "-j", "ACCEPT"])
+
+    # Policy routing: ldn から受信した NATed reply を gretap1 へ
+    run(["ip", "rule", "add", "iif", ifname,
+         "to", f"169.254.{nid}.0/24", "table", "100"])
+    run(["ip", "route", "add", f"169.254.{nid}.0/24",
+         "dev", "gretap1", "table", "100"])
+
+
+def teardown_primary(ifname, network_id):
+    """Primary: routing+NAT ルールとトンネルを削除する。"""
+    print("Cleaning up primary...")
+    nid = network_id
+    run_quiet(["ip", "rule", "del", "iif", ifname,
+               "to", f"169.254.{nid}.0/24", "table", "100"])
+    run_quiet(["ip", "route", "del", f"169.254.{nid}.0/24",
+               "table", "100"])
+    run_quiet(["iptables", "-t", "nat", "-D", "POSTROUTING",
+               "-o", ifname, "-s", f"169.254.{nid}.0/24",
+               "-j", "MASQUERADE"])
+    run_quiet(["iptables", "-D", "FORWARD",
+               "-i", "gretap1", "-o", ifname, "-j", "ACCEPT"])
+    run_quiet(["iptables", "-D", "FORWARD",
+               "-i", ifname, "-o", "gretap1", "-j", "ACCEPT"])
     run_quiet(["ip", "link", "del", "gretap1"])
 
 
-def setup_station_relay(ifname="ldn"):
-    """Primary: station IF と bridge 間の L2 リレーを tc mirred redirect で構成する。
-
-    managed-mode WiFi STA は直接 bridge に追加できない (EOPNOTSUPP) ため、
-    veth pair + tc ingress redirect で双方向パケットフォワーディングを行う。
-
-    パケット経路:
-      受信: Switch A → [station IF] →(tc)→ [relay-sta] →(veth)→ [relay-br] → bridge
-      送信: bridge → [relay-br] →(veth)→ [relay-sta] →(tc)→ [station IF] → Switch A
-    """
-    # veth pair 作成
-    run(["ip", "link", "add", "relay-sta", "type", "veth",
-         "peer", "name", "relay-br"])
-    run(["ip", "link", "set", "relay-sta", "up"])
-    run(["ip", "link", "set", "relay-br", "up"])
-
-    # relay-br を bridge に追加
-    run(["ip", "link", "set", "relay-br", "master", "br-ldn"])
-
-    # tc ingress redirect: station IF → relay-sta
-    run(["tc", "qdisc", "add", "dev", ifname, "ingress"])
-    run(["tc", "filter", "add", "dev", ifname, "parent", "ffff:",
-         "protocol", "all", "u32", "match", "u32", "0", "0",
-         "action", "mirred", "egress", "redirect", "dev", "relay-sta"])
-
-    # tc ingress redirect: relay-sta → station IF
-    run(["tc", "qdisc", "add", "dev", "relay-sta", "ingress"])
-    run(["tc", "filter", "add", "dev", "relay-sta", "parent", "ffff:",
-         "protocol", "all", "u32", "match", "u32", "0", "0",
-         "action", "mirred", "egress", "redirect", "dev", ifname])
-
-    # IPv6 無効化
-    run(["sysctl", "-w", "net.ipv6.conf.relay-sta.disable_ipv6=1"])
-    run(["sysctl", "-w", "net.ipv6.conf.relay-br.disable_ipv6=1"])
+def teardown_secondary():
+    """Secondary: bridge とトンネルを削除する。"""
+    print("Cleaning up secondary...")
+    run_quiet(["ip", "link", "del", "br-ldn"])
+    run_quiet(["ip", "link", "del", "gretap1"])
 
 
 def add_tap_to_bridge():
@@ -121,8 +155,9 @@ def patch_secondary_network(network, net_msg):
 
     1. _network_id を Switch A のサブネット ID に統一 (__init__.py:1512)
     2. participant 0 を Switch A の情報に書き換え (__init__.py:1514-1521)
-    3. TAP IP を再設定 (__init__.py:1781 で設定済みのランダム値を修正)
-    4. _register_participant を index 1+ に制限 (__init__.py:1732-1734)
+    3. participant 1 (PC A) を非表示 — Switch B に見せる必要なし
+    4. TAP IP を .254 に設定 — Switch A 宛て通信を横取りしない
+    5. _register_participant を index 2-7 に制限 — index 0=Switch A, 1=PC A(予約)
     """
     network_id = net_msg["network_id"]
     host = net_msg["participants"][0]
@@ -138,23 +173,30 @@ def patch_secondary_network(network, net_msg):
     p0.app_version = host["app_version"]
     p0.platform = host["platform"]
 
-    # 3. TAP IP 再設定 (_initialize_network でランダム値が設定済み)
+    # 3. participant 1 (PC A) を非表示
+    #    APNetwork.__init__ が participant 0 = 自身として設定するため、
+    #    num_participants は既に 1 (participant 0 のみ)。
+    #    participant 1 は未使用状態のまま。書き換えは不要。
+
+    # 4. TAP IP を .254 に設定
+    #    .1 = Switch A, .2 = PC A のため、TAP に .1 を使うと Switch A 宛て通信を
+    #    横取りしてしまう。.254 は participant IP 範囲外で安全。
     subprocess.run(["ip", "addr", "flush", "dev", "ldn-tap"], check=True)
     subprocess.run(["ip", "addr", "add",
-                    f"169.254.{network_id}.1/24",
+                    f"169.254.{network_id}.254/24",
                     "brd", f"169.254.{network_id}.255",
                     "dev", "ldn-tap"], check=True)
 
-    # 4. _register_participant パッチ (index 0 は Switch A 用に予約)
+    # 5. _register_participant パッチ (index 0=Switch A, 1=PC A 予約, 2-7=Switch B+)
     async def patched_register(self, address, name, app_version, platform):
         target_index = None
-        for idx in range(1, 8):
+        for idx in range(2, 8):
             if not self._network.participants[idx].connected:
                 target_index = idx
                 break
 
         if target_index is None:
-            print("  [WARN] No free participant slot (index 1-7)")
+            print("  [WARN] No free participant slot (index 2-7)")
             return
 
         self._peers.append(address)
@@ -520,11 +562,12 @@ async def run_primary(args):
                     print(f"  [DISCONNECT] reason={event.reason}")
                     break
         else:
-            # Full mode: tunnel + control channel
-            print("=== 3. GRETAP tunnel + bridge ===")
-            setup_tunnel(args.local, args.remote)
+            # Full mode: tunnel + routing + control channel
+            print("=== 3. GRETAP tunnel + routing ===")
+            setup_tunnel_primary(args.local, args.remote)
+            network_id = sta._network_id
             try:
-                setup_station_relay()
+                setup_primary_routing("ldn", network_id)
                 print()
 
                 # TCP listener — セカンダリ再接続のため開き続ける
@@ -585,7 +628,7 @@ async def run_primary(args):
                         await listener.aclose()
 
             finally:
-                teardown_tunnel()
+                teardown_primary("ldn", network_id)
 
 
 async def run_secondary(args):
@@ -594,7 +637,7 @@ async def run_secondary(args):
 
     # 1. GRETAP + bridge
     print("=== 1. GRETAP tunnel + bridge ===")
-    setup_tunnel(args.local, args.remote)
+    setup_tunnel_secondary(args.local, args.remote)
     print()
 
     try:
@@ -646,7 +689,7 @@ async def run_secondary(args):
                     handle_peer_messages_secondary, network, reader)
 
     finally:
-        teardown_tunnel()
+        teardown_secondary()
 
 
 async def main():
