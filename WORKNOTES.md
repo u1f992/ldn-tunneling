@@ -98,39 +98,202 @@
 
 ## Phase 2: リモート接続 (L2 トンネル)
 
-### アーキテクチャ
+### アーキテクチャ (v2: 参加者同期あり)
 ```
-[Switch A] --LDN--> [PC A: ldn-tap] <-> [br-ldn] <-> [gretap1]
-                                                        |
-                                                    WireGuard
-                                                        |
-[Switch B] --LDN--> [PC B: ldn-tap] <-> [br-ldn] <-> [gretap1]
+[Switch A] --LDN--> [PC A: APNetwork]
+                        |
+                     ldn-tap ←→ br-ldn ←→ gretap1
+                                             |
+                        TCP control channel + WireGuard
+                                             |
+                     ldn-tap ←→ br-ldn ←→ gretap1
+                        |
+[Switch B] --LDN--> [PC B: APNetwork]
 ```
-- 両拠点で `tunnel_node.py` を実行
-- GRETAP over WireGuard で L2 トンネル構築
-- Linux ブリッジ (`br-ldn`) で `ldn-tap` と `gretap1` を接続
-- Switch 同士が LDN レイヤで直接通信可能になる想定
+- 両 PC とも `ldn.create_network()` で APNetwork を使用
+  - `ldn.connect()` の STANetwork は TAP インターフェースを持たないため不可
+  - APNetwork のみが TAP を作成し、Wi-Fi ↔ TAP のデータブリッジを行う
+- GRETAP over WireGuard で TAP 間を L2 ブリッジ
+- TCP 制御チャネルで参加者リストを同期
 
-### Step 1: tunnel_node.py 準備 ★完了
-- [x] `tunnel_node.py` 作成済み
-- 機能:
-  1. GRETAP トンネル + Linux ブリッジ (`br-ldn`) を作成
-  2. MK8DX パラメータをスキャンで取得
-  3. 取得パラメータで LDN ネットワークをホスト
-  4. `ldn-tap` を `br-ldn` に接続
-  5. 終了時にトンネル・ブリッジをクリーンアップ
-- 使い方: `sudo .venv/bin/python tunnel_node.py prod.keys --local <wg_ip> --remote <wg_ip>`
-- 前提: 両拠点間に WireGuard トンネルが構築済みであること
+### v1 → v2 の設計変更理由
+v1 は「両拠点が独立に LDN ホスト → TAP を L2 ブリッジ」の単純設計だった。
+しかし以下の問題が判明:
+1. **Pia が LDN 参加者リストに依存**: Pia（ゲーム通信層）は LDN アドバタイズメントの
+   参加者リスト（IP/MAC）からピアを発見する。独立した LDN ネットワークでは
+   対向の Switch が参加者リストに存在せず、Pia がピアを発見できない
+2. **データ経路は正常**: TAP ↔ bridge ↔ GRETAP の L2 転送は問題なく機能する。
+   `_transmit_data_frames` は peer チェックなしで TAP→Wi-Fi broadcast する
+3. **制御平面の同期が必要**: 参加者リストの同期が必要 — データ平面は既に OK
 
-### Step 2: 単拠点動作確認 ★未着手
-- [ ] tunnel_node.py を片側だけ起動し、GRETAP + ブリッジ作成まで動作確認
-- [ ] ldn-tap がブリッジに正しく接続されることを確認
-- [ ] Switch から LDN ネットワークが見えることを確認
+### monkey-patch の設計 (kinnay/LDN v0.0.16 内部操作)
+ライブラリの public API では参加者リスト操作・サブネット指定ができないため、
+APNetwork の private 属性を直接操作する。
 
-### Step 3: 両拠点接続テスト ★未着手
-- [ ] 両拠点で tunnel_node.py を起動
-- [ ] 各 Switch がローカル通信で相手拠点のネットワークに参加できることを確認
-- [ ] ゲーム内で対戦が成立することを確認
+1. **`_network_id` 統一** (`__init__.py:1512`)
+   - ライブラリは `random.randint(1, 127)` でサブネット ID を生成
+   - 両 PC で同一値にしないと IP サブネット (169.254.X.0/24) が不一致
+   - APNetwork 構築後、`start()` 前に上書き: `network._network_id = <shared>`
+   - 参加者 IP は `169.254.{_network_id}.{index+1}` で算出 (`__init__.py:1739`)
+   - TAP の IP も `169.254.{_network_id}.1` (`__init__.py:1781`)
+
+2. **参加者インデックス分離** (`__init__.py:1732-1734`)
+   - ライブラリは index 0 から順に空きスロットを探す
+   - 両 PC が同じ index を使うと IP 衝突 (169.254.X.2 が両側に存在)
+   - primary: index 1-3 (IP .2-.4)、secondary: index 4-6 (IP .5-.7) を使用
+   - `_register_participant` を monkey-patch してインデックス範囲を制限
+
+3. **仮想参加者注入** (制御チャネル経由)
+   - 対向で Switch が JOIN → 制御チャネルで通知 → ローカルに仮想追加
+   - `network._network.participants[index] = ParticipantInfo(...)` で直接書き込み
+   - `network._update_nonce()` (`__init__.py:1675`) でアドバタイズメント更新
+   - 次の 100ms 周期で新しい参加者リストがブロードキャストされる
+
+### 制御チャネルプロトコル (TCP over WireGuard)
+- Secondary が Primary の TCP ポート 39571 に接続
+- JSON lines 形式 (1行 = 1メッセージ)
+- メッセージ種別:
+  - `PARAMS`: primary → secondary (ゲームパラメータ + network_id)
+  - `READY`: secondary → primary (LDN ホスト準備完了)
+  - `JOIN`: either → either (Switch 参加 {index, ip, mac, name})
+  - `LEAVE`: either → either (Switch 離脱 {index})
+
+### Step 1: tunnel_node.py v1 準備 ★完了 (v2 で置換)
+- [x] `tunnel_node.py` v1 作成済み (単純な GRETAP + ホストのみ)
+
+### Step 2: tunnel_node.py v2 実装 ★完了
+- [x] 制御チャネル (TCP) 実装 — LineReader + JSON lines
+- [x] monkey-patch (_network_id、_register_participant)
+- [x] 仮想参加者注入 (inject/remove_virtual_participant)
+- [x] GRETAP + bridge 構築 (setup/teardown_tunnel, add_tap_to_bridge)
+- [x] 構文チェック・import 確認・CLI help 正常動作確認
+- 実装上の発見:
+  - `trio.BufferedByteStream` は存在しない → 独自 LineReader クラスで代替
+  - `create_network()` の context manager は yield 前に `_initialize_network()` を
+    実行するため、TAP IP は `_network_id` 上書き前のランダム値で設定される。
+    `patch_network_id()` で `ip addr flush` + `ip addr add` による事後修正を追加
+- 単拠点テスト結果 (--solo モード):
+  - NM 管理外設定に `ldn` インターフェースの追加が必要だった
+    (`make_create_param` で ifname 未設定 → デフォルト `"ldn"` → NM が管理しようとして ENETDOWN)
+    `/etc/NetworkManager/conf.d/99-ldn-unmanaged.conf` に `interface-name:ldn` を追加
+  - スキャン → ホスト → Switch 参加 (JoinEvent idx=1, IP=169.254.X.2) まで正常動作
+  - Switch は参加後 2 秒で「通信エラー」→ Pia が participant 0 (PC) と UDP 通信を試みるが
+    PC は Pia を話さないためタイムアウト。2拠点で Switch 同士が通信できれば解消する見込み
+- **v2 の根本的欠陥が判明 → v3 へ移行** (後述)
+
+### v2 → v3 の設計変更理由
+
+v2 は両 PC が `create_network()` でホストする対称設計だが、以下の根本的欠陥がある:
+
+1. **ゲームホスト問題**: PC が participant 0 (LDN ホスト) になるため、ゲーム進行権限も PC に渡る。
+   MK8DX では部屋のホストがゲームモード・コースを選択するが、PC はゲームを実行していないため操作不能。
+   Switch は両方とも「参加者」として入るため、誰もゲームを進行できない → デッドロック。
+2. **パススルーではない**: 本来の目的は「ローカル通信の WAN 越えパススルー」。
+   Switch A が部屋を作り、Switch B が WAN 越しにその部屋に参加する形にすべき。
+   v2 は「PC が部屋を作り Switch が参加」であり、パススルーになっていない。
+
+v3 では Switch A がホスト (部屋作成者) のまま、PC は透過的リレーとして動作する
+非対称アーキテクチャに変更する。
+
+### アーキテクチャ (v3: 非対称 STA + AP)
+```
+[Switch A: LDN ホスト (部屋作成)]       ← ゲーム進行の主導権
+       ↕ Wi-Fi (LDN)
+[PC A: connect() = STA として参加]      ← 透過リレー
+   station IF ←→ br-ldn ←→ gretap1
+                                ↕ WireGuard + TCP control
+   ldn-tap ←→ br-ldn ←→ gretap1
+[PC B: create_network() = AP プロキシ]  ← Switch A の部屋を複製
+       ↕ Wi-Fi (LDN)
+[Switch B: PC B の部屋に参加]           ← Switch A の部屋に参加した体験
+```
+
+- **Primary (PC A)**: `ldn.connect()` で Switch A の部屋に STA として参加
+  - Station IF (managed mode) 1 つのみ。monitor/TAP なし
+  - データはカーネル Wi-Fi スタック経由 (Python を介さない)
+  - `_monitor_network()` で Switch A の advertisement 変更を監視
+  - station IF を Linux bridge に追加し GRETAP 経由でトンネル
+- **Secondary (PC B)**: `ldn.create_network()` で Switch A の部屋を複製した AP を起動
+  - AP + monitor + TAP の 3 構成 (v2 と同じ)
+  - participant 0 を Switch A の情報に書き換え → Switch B から見て Switch A がホスト
+  - `application_data` を制御チャネル経由でリアルタイム同期
+
+### v3 monkey-patch (PC B のみ)
+
+1. **`_network_id` 統一**: Switch A のサブネット ID に合わせる
+   - PC A が STANetwork の `_network_id` を取得 → 制御チャネルで送信
+2. **participant 0 書き換え**: Switch A の情報 (IP, MAC, name) を設定
+   - BSSID (PC B MAC) と participant 0 MAC は不一致だが問題なし
+   - STA は自身の MAC で participant list を検索する (`__init__.py:1387-1389`)
+3. **`_register_participant` パッチ**: Switch B を index 1+ に割り当て
+4. **`application_data` 同期**: PC A → 制御チャネル → PC B が更新 + `_update_nonce()`
+
+### v3 制御チャネルプロトコル
+- `NETWORK`: PC A → PC B (Switch A の全状態: params, participants, network_id)
+- `READY`: PC B → PC A (APNetwork 起動完了)
+- `JOIN`/`LEAVE`: either → either (Switch 参加/離脱)
+- `APP_DATA`: PC A → PC B (application_data 更新)
+- `ACCEPT`: PC A → PC B (accept_policy 更新)
+
+### v3 主要リスク
+- Switch A の Pia が Switch B を認識しない可能性 (Switch B は Switch A の participant list に不在)
+- 対策: まず試す → 失敗なら raw frame relay に移行
+
+### Step 3: tunnel_node.py v3 実装 ★進行中
+- [x] Primary: scan → connect() → bridge station IF → control channel
+- [x] Secondary: receive params → create_network() → patch → bridge TAP
+- [x] 構文チェック・CLI help 確認
+- [x] 単拠点テスト (--solo) ★成功
+- [ ] 2拠点接続テスト
+- [ ] 問題対応
+
+#### v3 実装詳細 (tunnel_node.py)
+
+**v2 からの主要変更:**
+- `run_primary`: `create_network()` → `connect()` (STA として Switch A に参加)
+- `run_secondary`: participant 0 書き換え追加、`_register_participant` は index 1+ に制限
+- 制御チャネル: `params` → `network` メッセージに拡張 (全参加者情報含む)
+- 新メッセージ: `app_data` (ApplicationDataChanged 転送)、`accept` (AcceptPolicyChanged 転送)
+- `patch_network_id` + `patch_register_participant` → `patch_secondary_network` に統合
+- `add_station_to_bridge()` 追加 (Primary: station IF を bridge に追加)
+
+**Primary (`run_primary`):**
+1. `scan_mk8dx()` → Switch A の MK8DX 部屋を発見
+2. `ldn.connect(param)` → STA として参加 (`ConnectNetworkParam` 使用)
+3. `--solo`: イベント監視のみ (JoinEvent, ApplicationDataChanged, DisconnectEvent)
+4. `--solo` なし: `setup_tunnel()` → `add_station_to_bridge("ldn")` → control channel
+5. `make_network_msg(sta)` で STANetwork の全状態を Secondary に送信
+6. `handle_primary_events`: ApplicationDataChanged/AcceptPolicyChanged を Secondary に転送
+7. `handle_peer_messages_primary`: Secondary からの JOIN/LEAVE をログ記録 (注入不可)
+
+**Secondary (`run_secondary`):**
+1. `setup_tunnel()` → Primary に TCP 接続
+2. `recv_msg()` で NETWORK メッセージ受信 → `make_create_param()` で CreateNetworkParam 構築
+3. `ldn.create_network(param)` → AP ホスト
+4. `patch_secondary_network()`:
+   - `_network_id` = Switch A のサブネット ID (__init__.py:1512)
+   - participant 0 = Switch A の情報 (IP, MAC, name) (__init__.py:1514-1521)
+   - TAP IP = `169.254.{network_id}.1/24` (ip addr flush + add)
+   - `_register_participant` monkey-patch: index 1-7 のみ使用 (__init__.py:1732-1734)
+   - `_update_nonce()` でアドバタイズメント更新
+5. `add_tap_to_bridge()` → READY 送信
+6. `handle_secondary_events`: Switch B の JOIN/LEAVE を Primary に転送
+7. `handle_peer_messages_secondary`: APP_DATA → `set_application_data()`、ACCEPT → `set_accept_policy()`
+
+**--solo テスト結果:**
+- コマンド: `sudo .venv/bin/python tunnel_node.py prod.keys --role primary --local 10.8.0.2 --remote 10.8.0.5 --phy phy1 --solo`
+- スキャン: 2/10 で MK8DX 検出 (ch=1, proto=1, ver=4, app_ver=14, BSSID=5C:52:1E:EA:EB:9E)
+- STA 参加成功: participant 1, network_id=25, IP=169.254.25.2
+- Host (Switch A): IP=169.254.25.1, MAC=5C:52:1E:EA:EB:9E
+- Ctrl+C まで安定接続 (v2 では 2 秒で Pia timeout → 通信エラーだったが、v3 では PC がホストでないため発生せず)
+- Ctrl+C 時の ExceptionGroup は trio nursery 経由の正常な KeyboardInterrupt 伝播
+
+**既知のリスク (未検証):**
+- `add_station_to_bridge("ldn")` が managed-mode WiFi で動作するか未確認
+  - Linux は通常 STA を bridge に追加できない (4addr mode が必要な場合あり)
+  - 失敗した場合は `iw dev ldn set 4addr on` を試行
+- Switch A の Pia が Switch B を認識しない可能性
+  - Switch A の participant list に Switch B がいない (Primary の STANetwork は注入不可)
 
 ---
 
@@ -443,9 +606,16 @@ sudo systemctl reload NetworkManager
 - fork の NEW_KEY/SET_KEY 削除は NM 干渉の回避策であって正しい修正ではない
 - メンテナ (kinnay) のコメント通り、鍵削除はコントロールポートフレームの暗号化を壊す
 - 正しい対応: NM 管理外設定をドキュメントに追記 (または LDN コード内で `nmcli device set <ifname> managed no` を実行)
-- Step 4 のパッチ要件を再評価する必要あり:
-  - NEW_KEY/SET_KEY 削除 → **不要** (NM 修正で解決)
-  - REGISTER_FRAME 順序変更 → 要再検証 (NM 修正後も必要か)
+- **PR #8 は CLOSED** — NM が根本原因と確認され、upstream の README に NM 管理外設定が追記済み
+
+**ローカルパッチの清掃 (2026-02-22):**
+- `.venv` 内の `wlan.py` に Phase 1 の REGISTER_FRAME 順序変更パッチが残存していた
+  - `_register_frame()` 呼び出しを `_start_ap()` の前に移動するパッチ
+  - PR #8 が CLOSED になり、upstream コードで NM 管理外設定のみで動作することが確認済み
+  - → パッチは不要
+- `.venv` を削除し `uv sync --no-cache` でクリーン再構築
+- upstream ldn 0.0.16 未パッチ状態で `--solo` テスト → スキャン・ホスト・Switch 参加すべて正常動作
+- **結論: ライブラリへのパッチは一切不要。NM 管理外設定のみで十分**
 
 ### 2026-02-21: GBAtempスレッド調査
 - https://gbatemp.net/threads/local-wireless-play-over-internet.516675/ (2018年)

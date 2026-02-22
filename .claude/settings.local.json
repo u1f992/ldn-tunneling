@@ -23,7 +23,9 @@
       "Bash(/home/mukai/Documents/ldn-tunneling/.venv/bin/pip show:*)",
       "Bash(/home/mukai/Documents/ldn-tunneling/.venv/bin/python:*)",
       "Bash(tail:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "WebFetch(domain:ldn.readthedocs.io)",
+      "Bash(.venv/bin/python:*)"
     ]
   }
 }
