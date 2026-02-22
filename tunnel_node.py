@@ -345,35 +345,40 @@ async def handle_primary_events(sta, peer_stream):
     - ApplicationDataChanged: ゲーム状態の更新 (ロビー、コース選択等)
     - AcceptPolicyChanged: 参加受付ポリシーの変更
     - DisconnectEvent: Switch A との接続断
+
+    peer_stream への書き込み失敗は Secondary 切断を意味するので静かに終了する。
     """
-    while True:
-        event = await sta.next_event()
-        if isinstance(event, ldn.JoinEvent):
-            p = event.participant
-            print(f"  [PRIMARY JOIN] idx={event.index}"
-                  f" {p.name.decode(errors='replace')}"
-                  f" IP={p.ip_address} MAC={p.mac_address}")
-            await send_msg(peer_stream, make_join_msg(event.index, p))
-        elif isinstance(event, ldn.LeaveEvent):
-            p = event.participant
-            print(f"  [PRIMARY LEAVE] idx={event.index}"
-                  f" {p.name.decode(errors='replace')}")
-            await send_msg(peer_stream, make_leave_msg(event.index))
-        elif isinstance(event, ldn.ApplicationDataChanged):
-            print(f"  [APP_DATA] {len(event.new)} bytes")
-            await send_msg(peer_stream, {
-                "type": "app_data",
-                "data": event.new.hex(),
-            })
-        elif isinstance(event, ldn.AcceptPolicyChanged):
-            print(f"  [ACCEPT] {event.old} -> {event.new}")
-            await send_msg(peer_stream, {
-                "type": "accept",
-                "policy": event.new,
-            })
-        elif isinstance(event, ldn.DisconnectEvent):
-            print(f"  [DISCONNECT] reason={event.reason}")
-            break
+    try:
+        while True:
+            event = await sta.next_event()
+            if isinstance(event, ldn.JoinEvent):
+                p = event.participant
+                print(f"  [PRIMARY JOIN] idx={event.index}"
+                      f" {p.name.decode(errors='replace')}"
+                      f" IP={p.ip_address} MAC={p.mac_address}")
+                await send_msg(peer_stream, make_join_msg(event.index, p))
+            elif isinstance(event, ldn.LeaveEvent):
+                p = event.participant
+                print(f"  [PRIMARY LEAVE] idx={event.index}"
+                      f" {p.name.decode(errors='replace')}")
+                await send_msg(peer_stream, make_leave_msg(event.index))
+            elif isinstance(event, ldn.ApplicationDataChanged):
+                print(f"  [APP_DATA] {len(event.new)} bytes")
+                await send_msg(peer_stream, {
+                    "type": "app_data",
+                    "data": event.new.hex(),
+                })
+            elif isinstance(event, ldn.AcceptPolicyChanged):
+                print(f"  [ACCEPT] {event.old} -> {event.new}")
+                await send_msg(peer_stream, {
+                    "type": "accept",
+                    "policy": event.new,
+                })
+            elif isinstance(event, ldn.DisconnectEvent):
+                print(f"  [DISCONNECT] reason={event.reason}")
+                break
+    except (trio.ClosedResourceError, trio.BrokenResourceError):
+        pass
 
 
 async def handle_secondary_events(network, peer_stream):
@@ -522,39 +527,62 @@ async def run_primary(args):
                 setup_station_relay()
                 print()
 
-                # Wait for secondary
-                print(f"=== 4. Waiting for secondary on port {CONTROL_PORT} ===")
+                # TCP listener — セカンダリ再接続のため開き続ける
                 listeners = await trio.open_tcp_listeners(
                     CONTROL_PORT, host=args.local)
-                print(f"  Listening on {args.local}:{CONTROL_PORT}")
+                try:
+                    while True:
+                        print(f"=== 4. Waiting for secondary on port"
+                              f" {CONTROL_PORT} ===")
+                        print(f"  Listening on"
+                              f" {args.local}:{CONTROL_PORT}")
 
-                peer_stream = await listeners[0].accept()
-                for listener in listeners:
-                    await listener.aclose()
-                reader = LineReader(peer_stream)
-                print("  Secondary connected!")
+                        peer_stream = await listeners[0].accept()
+                        reader = LineReader(peer_stream)
+                        print("  Secondary connected!")
 
-                # Send NETWORK message
-                net_msg = make_network_msg(sta)
-                await send_msg(peer_stream, net_msg)
-                print("  NETWORK sent, waiting for READY...")
+                        # Send NETWORK message
+                        net_msg = make_network_msg(sta)
+                        await send_msg(peer_stream, net_msg)
+                        print("  NETWORK sent, waiting for READY...")
 
-                ready_msg = await recv_msg(reader)
-                assert ready_msg["type"] == "ready", \
-                    f"Expected 'ready', got {ready_msg}"
-                print("  Secondary is ready!")
-                print()
+                        try:
+                            ready_msg = await recv_msg(reader)
+                        except (trio.ClosedResourceError,
+                                trio.EndOfChannel):
+                            print("  Secondary disconnected"
+                                  " before READY")
+                            continue
+                        assert ready_msg["type"] == "ready", \
+                            f"Expected 'ready', got {ready_msg}"
+                        print("  Secondary is ready!")
+                        print()
 
-                print("=== Ready ===")
-                print("Switch B で「ローカル通信」から参加してください")
-                print("Ctrl+C で終了")
-                print()
+                        print("=== Ready ===")
+                        print("Switch B で「ローカル通信」"
+                              "から参加してください")
+                        print("Ctrl+C で終了")
+                        print()
 
-                async with trio.open_nursery() as nursery:
-                    nursery.start_soon(
-                        handle_primary_events, sta, peer_stream)
-                    nursery.start_soon(
-                        handle_peer_messages_primary, sta, reader)
+                        async with trio.open_nursery() as nursery:
+                            nursery.start_soon(
+                                handle_primary_events,
+                                sta, peer_stream)
+
+                            async def _wait_secondary(
+                                    reader=reader):
+                                await handle_peer_messages_primary(
+                                    sta, reader)
+                                nursery.cancel_scope.cancel()
+
+                            nursery.start_soon(_wait_secondary)
+
+                        print()
+                        print("  Secondary disconnected,"
+                              " accepting reconnection...")
+                finally:
+                    for listener in listeners:
+                        await listener.aclose()
 
             finally:
                 teardown_tunnel()

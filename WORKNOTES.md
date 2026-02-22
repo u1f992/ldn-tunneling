@@ -244,8 +244,9 @@ v3 では Switch A がホスト (部屋作成者) のまま、PC は透過的リ
 - [x] Secondary: receive params → create_network() → patch → bridge TAP
 - [x] 構文チェック・CLI help 確認
 - [x] 単拠点テスト (--solo) ★成功
-- [ ] 2拠点接続テスト
-- [ ] 問題対応
+- [x] 2拠点接続テスト ★ロビー参加確認
+- [ ] Pia 接続問題対応
+- [ ] 再起動手順の改善
 
 #### v3 実装詳細 (tunnel_node.py)
 
@@ -300,6 +301,17 @@ v3 では Switch A がホスト (部屋作成者) のまま、PC は透過的リ
 **ファイアウォール設定:**
 - Primary 側で TCP 39571 (制御チャネル) を WireGuard サブネットから許可する必要あり
 - `sudo ufw allow from 10.8.0.0/24 to any port 39571 proto tcp`
+
+**ENOTUNIQ エラーの根本原因 (セカンダリ、解決済み):**
+- 症状: `create_network()` → `self.up()` → `RTM_NEWLINK` (IFF_UP) が `OSError: [Errno 76] Name not unique on network` を返す
+- ライブラリの問題ではない。手動 `iw phy phy2 interface add test-ap type __ap && ip link set test-ap up` でも再現
+- 根本原因: S3 サスペンド/レジューム時に xHCI コントローラがエラー (`USBSTS 0x401, Reinit`)
+  → mt76x2u ドライバの内部状態が壊れ、AP インターフェースを UP できない状態に
+- 修正: A6210 を USB から物理的に抜き差し → ファームウェアとドライバが完全再初期化
+  → phy 番号が phy2 → phy3 に変更され、正常動作に復帰
+- 予防: サスペンド後は必ず A6210 を USB 抜き差し (または `rmmod mt76x2u && modprobe mt76x2u`)
+- セカンダリの NM 管理外設定: `/etc/NetworkManager/conf.d/99-ldn-unmanaged.conf` に
+  `interface-name:wlx*;interface-name:ldn` を設定済み
 
 **既知のリスク (未検証):**
 - Switch A の Pia が Switch B を認識しない可能性
