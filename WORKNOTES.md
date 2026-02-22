@@ -297,6 +297,10 @@ v3 では Switch A がホスト (部屋作成者) のまま、PC は透過的リ
   - `tc ingress redirect` で station IF ↔ relay-sta を双方向リダイレクト
   - パケット経路: Switch A → [ldn] →(tc)→ [relay-sta] →(veth)→ [relay-br] → bridge → gretap1
 
+**ファイアウォール設定:**
+- Primary 側で TCP 39571 (制御チャネル) を WireGuard サブネットから許可する必要あり
+- `sudo ufw allow from 10.8.0.0/24 to any port 39571 proto tcp`
+
 **既知のリスク (未検証):**
 - Switch A の Pia が Switch B を認識しない可能性
   - Switch A の participant list に Switch B がいない (Primary の STANetwork は注入不可)

@@ -518,7 +518,7 @@ async def run_primary(args):
 
                 peer_stream = await listeners[0].accept()
                 for listener in listeners:
-                    listener.close()
+                    await listener.aclose()
                 reader = LineReader(peer_stream)
                 print("  Secondary connected!")
 
