@@ -288,10 +288,16 @@ v3 では Switch A がホスト (部屋作成者) のまま、PC は透過的リ
 - Ctrl+C まで安定接続 (v2 では 2 秒で Pia timeout → 通信エラーだったが、v3 では PC がホストでないため発生せず)
 - Ctrl+C 時の ExceptionGroup は trio nursery 経由の正常な KeyboardInterrupt 伝播
 
+**station IF ブリッジ問題と解決:**
+- `ip link set ldn master br-ldn` → `Error: Device does not allow enslaving to a bridge.`
+- managed-mode WiFi STA は mac80211 が bridge への追加を拒否する (EOPNOTSUPP)
+- **解決: veth pair + tc mirred redirect**
+  - `relay-sta` ↔ `relay-br` の veth pair を作成
+  - `relay-br` を bridge に追加
+  - `tc ingress redirect` で station IF ↔ relay-sta を双方向リダイレクト
+  - パケット経路: Switch A → [ldn] →(tc)→ [relay-sta] →(veth)→ [relay-br] → bridge → gretap1
+
 **既知のリスク (未検証):**
-- `add_station_to_bridge("ldn")` が managed-mode WiFi で動作するか未確認
-  - Linux は通常 STA を bridge に追加できない (4addr mode が必要な場合あり)
-  - 失敗した場合は `iw dev ldn set 4addr on` を試行
 - Switch A の Pia が Switch B を認識しない可能性
   - Switch A の participant list に Switch B がいない (Primary の STANetwork は注入不可)
 

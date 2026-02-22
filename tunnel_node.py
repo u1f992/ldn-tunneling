@@ -55,14 +55,46 @@ def setup_tunnel(local_ip, remote_ip):
 
 def teardown_tunnel():
     print("Cleaning up...")
+    run_quiet(["tc", "qdisc", "del", "dev", "ldn", "ingress"])
+    run_quiet(["ip", "link", "del", "relay-sta"])   # veth peer も自動削除
     run_quiet(["ip", "link", "del", "br-ldn"])
     run_quiet(["ip", "link", "del", "gretap1"])
 
 
-def add_station_to_bridge(ifname="ldn"):
-    """Primary: station IF を br-ldn に追加する。"""
-    run(["ip", "link", "set", ifname, "master", "br-ldn"])
-    run(["sysctl", "-w", f"net.ipv6.conf.{ifname}.disable_ipv6=1"])
+def setup_station_relay(ifname="ldn"):
+    """Primary: station IF と bridge 間の L2 リレーを tc mirred redirect で構成する。
+
+    managed-mode WiFi STA は直接 bridge に追加できない (EOPNOTSUPP) ため、
+    veth pair + tc ingress redirect で双方向パケットフォワーディングを行う。
+
+    パケット経路:
+      受信: Switch A → [station IF] →(tc)→ [relay-sta] →(veth)→ [relay-br] → bridge
+      送信: bridge → [relay-br] →(veth)→ [relay-sta] →(tc)→ [station IF] → Switch A
+    """
+    # veth pair 作成
+    run(["ip", "link", "add", "relay-sta", "type", "veth",
+         "peer", "name", "relay-br"])
+    run(["ip", "link", "set", "relay-sta", "up"])
+    run(["ip", "link", "set", "relay-br", "up"])
+
+    # relay-br を bridge に追加
+    run(["ip", "link", "set", "relay-br", "master", "br-ldn"])
+
+    # tc ingress redirect: station IF → relay-sta
+    run(["tc", "qdisc", "add", "dev", ifname, "ingress"])
+    run(["tc", "filter", "add", "dev", ifname, "parent", "ffff:",
+         "protocol", "all", "u32", "match", "u32", "0", "0",
+         "action", "mirred", "egress", "redirect", "dev", "relay-sta"])
+
+    # tc ingress redirect: relay-sta → station IF
+    run(["tc", "qdisc", "add", "dev", "relay-sta", "ingress"])
+    run(["tc", "filter", "add", "dev", "relay-sta", "parent", "ffff:",
+         "protocol", "all", "u32", "match", "u32", "0", "0",
+         "action", "mirred", "egress", "redirect", "dev", ifname])
+
+    # IPv6 無効化
+    run(["sysctl", "-w", "net.ipv6.conf.relay-sta.disable_ipv6=1"])
+    run(["sysctl", "-w", "net.ipv6.conf.relay-br.disable_ipv6=1"])
 
 
 def add_tap_to_bridge():
@@ -475,7 +507,7 @@ async def run_primary(args):
             print("=== 3. GRETAP tunnel + bridge ===")
             setup_tunnel(args.local, args.remote)
             try:
-                add_station_to_bridge()
+                setup_station_relay()
                 print()
 
                 # Wait for secondary
