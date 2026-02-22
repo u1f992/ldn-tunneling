@@ -42,6 +42,13 @@ def run_quiet(cmd):
 
 # --- Network infrastructure ---
 
+def cleanup_stale_interfaces():
+    """前回の異常終了で残った LDN インターフェースを削除する。"""
+    for ifname in ["ldn", "ldn-mon", "ldn-tap", "relay-sta", "br-ldn", "gretap1"]:
+        run_quiet(["ip", "link", "del", ifname])
+    run_quiet(["tc", "qdisc", "del", "dev", "ldn", "ingress"])
+
+
 def setup_tunnel(local_ip, remote_ip):
     run(["ip", "link", "add", "gretap1", "type", "gretap",
          "local", local_ip, "remote", remote_ip, "key", "1"])
@@ -446,6 +453,7 @@ async def handle_peer_messages_secondary(network, reader):
 
 async def run_primary(args):
     keys = ldn.load_keys(args.keys)
+    cleanup_stale_interfaces()
 
     # 1. Scan
     print("=== 1. Scan for MK8DX ===")
@@ -550,6 +558,7 @@ async def run_primary(args):
 
 async def run_secondary(args):
     keys = ldn.load_keys(args.keys)
+    cleanup_stale_interfaces()
 
     # 1. GRETAP + bridge
     print("=== 1. GRETAP tunnel + bridge ===")
