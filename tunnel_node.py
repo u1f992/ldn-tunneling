@@ -44,7 +44,11 @@ def run_quiet(cmd):
 
 def cleanup_stale_interfaces():
     """前回の異常終了で残った LDN インターフェースを削除する。"""
-    for ifname in ["ldn", "ldn-mon", "ldn-tap", "relay-sta", "br-ldn", "gretap1"]:
+    # nl80211 仮想インターフェース (iw dev del が確実)
+    for ifname in ["ldn", "ldn-mon"]:
+        run_quiet(["iw", "dev", ifname, "del"])
+    # 通常のインターフェース
+    for ifname in ["ldn-tap", "relay-sta", "br-ldn", "gretap1"]:
         run_quiet(["ip", "link", "del", ifname])
     run_quiet(["tc", "qdisc", "del", "dev", "ldn", "ingress"])
 
