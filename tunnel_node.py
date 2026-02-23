@@ -431,10 +431,10 @@ async def handle_secondary_events(network, peer_stream):
 
 
 async def handle_peer_messages_primary(reader):
-    """Primary: Secondary からの LEAVE を受信してログに記録する。
+    """Primary: Secondary からのメッセージを処理する。
 
-    初期 JOIN は run_primary() で処理済み。
-    LEAVE を受信したら接続を終了する。
+    LEAVE はログに記録するのみ (自動終了しない)。
+    TCP 切断時のみ return → nursery cancel。
     """
     while True:
         try:
@@ -444,8 +444,8 @@ async def handle_peer_messages_primary(reader):
             break
 
         if msg["type"] == "leave":
-            print(f"  [REMOTE LEAVE] idx={msg['index']}")
-            break
+            print(f"  [REMOTE LEAVE] idx={msg['index']}"
+                  f" (continuing relay)")
         elif msg["type"] == "join":
             # 追加の参加者 (将来対応)
             print(f"  [REMOTE JOIN] idx={msg['index']}"
@@ -480,6 +480,20 @@ async def handle_peer_messages_secondary(network, reader):
         elif msg["type"] == "app_data":
             print(f"  [APP_DATA] updating ({len(msg['data']) // 2} bytes)")
             network.set_application_data(bytes.fromhex(msg["data"]))
+        elif msg["type"] == "connected":
+            primary_idx = msg["index"]
+            primary_ip = msg["ip"]
+            print(f"  [CONNECTED] Primary STA assigned: idx={primary_idx}"
+                  f" IP={primary_ip}")
+            # Switch B の IP と一致するか確認
+            for idx, p in enumerate(network._network.participants):
+                if p.connected and idx > 0:
+                    if p.ip_address != primary_ip:
+                        print(f"  [WARN] IP mismatch! Switch B has"
+                              f" {p.ip_address}, Primary expects"
+                              f" {primary_ip}")
+                    else:
+                        print(f"  [OK] IP match: {p.ip_address}")
         elif msg["type"] == "accept":
             print(f"  [ACCEPT] policy={msg['policy']}")
             network.set_accept_policy(msg["policy"])
@@ -601,10 +615,20 @@ async def run_primary(args):
             param.address = ldn.MACAddress(switch_b_mac)
 
             async with ldn.connect(param) as sta:
-                print(f"  Connected as STA (participant {sta._participant_id})")
-                print(f"  IP: {sta.participant().ip_address}")
+                sta_index = sta._participant_id
+                sta_ip = sta.participant().ip_address
+                print(f"  Connected as STA (participant {sta_index})")
+                print(f"  IP: {sta_ip}")
                 print(f"  MAC: {switch_b_mac} (spoofed)")
                 print()
+
+                # 6a. CONNECTED 通知 → Secondary に IP/index を同期
+                await send_msg(peer_stream, {
+                    "type": "connected",
+                    "index": sta_index,
+                    "ip": sta_ip,
+                })
+                print(f"  CONNECTED sent (idx={sta_index}, ip={sta_ip})")
 
                 # 7. Relay 構築
                 print("=== 6. Setting up relay ===")

@@ -615,6 +615,42 @@ kinnay/LDN v0.0.16 に以下の最小変更を追加:
 
 **`run_secondary()` は v3 と同一** (変更なし)。
 
+### v4 テスト結果 (1回目) と修正
+
+**テスト結果: ロビー参加成功、ゲーム開始時「通信相手からの応答がありませんでした」**
+
+tcpdump 分析で 3 つの問題を特定:
+
+**問題 1 (致命的): `_process_data_frame` の Ethernet dst マッピングバグ**
+- `__init__.py:1852` で `header.target = frame.target` (Address 1 = BSSID for ToDS)
+- 正しくは `header.target = frame.bssid` (Address 3 = DA for ToDS)
+- 結果: Switch B の unicast が全て dst = AP MAC (PC B) として TAP に書き込まれる
+- bridge が local delivery と判断 → gretap1 に到達せず → tunnel を通過しない
+- **tcpdump 証拠**: `b-tcpdump-ldn-tap.log` にユニキャスト存在、`b-tcpdump-gretap1.log` にユニキャスト不在
+
+**問題 2: IP 不一致 (潜在的)**
+- Switch A が spoofed STA に割り当てた IP と Secondary が Switch B に割り当てた IP が
+  異なる場合、Pia participant lookup が失敗
+- クリーンな状態 (Switch A の部屋を新規作成) なら両方 index 1 (.2) に一致するはず
+
+**問題 3 (軽微): Primary の LEAVE 自動終了**
+- `handle_peer_messages_primary` が LEAVE で break → nursery cancel → Primary 終了
+- Switch B が離脱しただけで Primary も終了してしまう
+
+**修正内容:**
+
+1. **ldn ライブラリ修正** (`ldn.patch` 更新):
+   - `_process_data_frame`: `header.target = frame.target` → `header.target = frame.bssid`
+   - ToDS の Address 3 (DA) を Ethernet dst に正しくマッピング
+
+2. **CONNECTED メッセージ追加** (`tunnel_node.py`):
+   - Primary: STA 接続後に `{"type":"connected", "index":N, "ip":"..."}` を Secondary に送信
+   - Secondary: 受信して Switch B の IP と一致確認、不一致なら WARNING ログ
+
+3. **LEAVE 自動終了の廃止** (`tunnel_node.py`):
+   - `handle_peer_messages_primary`: LEAVE で break せず、ログ記録のみ
+   - TCP 切断時のみ return → nursery cancel
+
 ---
 
 ## ログ
