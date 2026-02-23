@@ -247,8 +247,9 @@ v3 では Switch A がホスト (部屋作成者) のまま、PC は透過的リ
 - [x] 2拠点接続テスト ★ロビー参加確認
 - [x] 再起動手順の改善 (while True accept ループ)
 - [x] Pia 接続問題分析 → routing+NAT 設計
-- [x] routing+NAT 実装 (tunnel_node.py)
-- [ ] 2拠点テスト: routing+NAT で Pia 通信成立確認
+- [x] routing+NAT 実装 → テスト → 失敗 (gretap1: 0 packets, broadcast 転送不可)
+- [x] bridge+tc mirred 改良版実装 (MAC learning 無効化)
+- [ ] 2拠点テスト: bridge+tc mirred 改良版で Pia 通信成立確認
 
 #### v3 実装詳細 (tunnel_node.py)
 
@@ -380,33 +381,92 @@ Switch A → ldn IF (src=.1, dst=.2) → conntrack reverse (dst→.3)
 - Secondary: TAP IP を .254 に変更 (Switch A 宛て通信を横取りしない)
 - Secondary: participant 1 (PC A) を非表示 (Switch B に PC A を見せる必要なし)
 
-#### routing+NAT 実装 (tunnel_node.py コード変更)
+#### routing+NAT 実装と失敗 (廃止)
 
-**廃止した関数:**
-- `setup_tunnel()` → `setup_tunnel_primary()` / `setup_tunnel_secondary()` に分離
-- `teardown_tunnel()` → `teardown_primary()` / `teardown_secondary()` に分離
-- `setup_station_relay()` → 廃止 (veth pair + tc mirred redirect → 不要)
+routing+NAT を実装しテストしたが、以下の根本的欠陥により廃止:
 
-**新規関数:**
-- `setup_tunnel_primary(local_ip, remote_ip)`: gretap1 のみ (bridge なし)
-- `setup_tunnel_secondary(local_ip, remote_ip)`: gretap1 + br-ldn (従来の setup_tunnel と同じ)
-- `setup_primary_routing(ifname, network_id)`: routing + NAT セットアップ
-  - gretap1 に 169.254.{nid}.2/24 を付与
-  - proxy_arp=1, ip_forward=1
-  - iptables MASQUERADE: gretap1→ldn 送信時に src を PC A IP に書き換え
-  - iptables FORWARD: gretap1 ↔ ldn 間のフォワーディング許可
-  - ip rule + ip route table 100: ldn から受信した NATed reply を gretap1 へ
-- `teardown_primary(ifname, network_id)`: 上記の逆操作
-- `teardown_secondary()`: br-ldn + gretap1 削除
+**tcpdump 診断結果:**
+- `gretap1` (Primary): **0 packets** — トンネルにデータが一切流れていない
+- `ldn` (Primary): Switch A の Pia broadcast のみ
+  `169.254.22.1:12345 → 169.254.22.255:12345 UDP 196 bytes (~100ms)`
+  Switch A は Pia LAN ディスカバリを活発に送信しているが、gretap1 には転送されない
 
-**変更した関数:**
-- `cleanup_stale_interfaces()`: iptables flush, ip rule/route table 100 削除を追加
-- `patch_secondary_network()`:
-  - `_register_participant` range: `range(1, 8)` → `range(2, 8)` (index 1 = PC A 用)
-  - TAP IP: `169.254.{nid}.1/24` → `169.254.{nid}.254/24` (Switch A 宛て横取り防止)
-  - participant 1 (PC A): 非表示コメント追加 (APNetwork.__init__ で participant 0 のみ設定されるため書き換え不要)
-- `run_primary()`: `setup_tunnel()` + `setup_station_relay()` → `setup_tunnel_primary()` + `setup_primary_routing()`
-- `run_secondary()`: `setup_tunnel()` → `setup_tunnel_secondary()`、`teardown_tunnel()` → `teardown_secondary()`
+**根本的欠陥:**
+1. **IP routing はブロードキャストを転送しない**: Switch A の Pia broadcast (.255 宛て) は
+   カーネルがローカル配信として処理し、gretap1 にフォワードされない。
+   Pia セッション確立にはブロードキャスト受信が必須。
+2. **proxy_arp の in_dev 問題**: gretap1 に IP を付与しないと ARP 処理用の `in_dev`
+   構造体が存在せず、proxy_arp が機能しない可能性。
+   IP を付与すると ldn IF と重複ルートが発生し proxy_arp が壊れる。
+3. **Pia ペイロードのミスマッチ**: MASQUERADE は IP ヘッダの src を書き換えるが、
+   Pia UDP ペイロード内の送信者情報は書き換えない。
+   Switch A の Pia はヘッダとペイロードの不一致を検出する可能性。
+
+**結論:** routing+NAT は LDN/Pia の要件に根本的に適合しない。
+L2 ブロードキャストを自然に扱える bridge+tc mirred に回帰する。
+
+#### bridge+tc mirred 改良版 (MAC learning 無効化)
+
+routing+NAT の失敗を受け、bridge+tc mirred に回帰。
+ただし旧 bridge+tc mirred にも問題があったため改良:
+
+**旧 bridge+tc mirred の問題:**
+- ブロードキャストは正常に転送される (ロビー動作)
+- **ユニキャスト復路が失敗**: Switch A が PC A の MAC 宛てに送信
+  → bridge が PC A の MAC を relay-br ポートで学習済み
+  → 同一ポートへの転送なし → gretap1 に到達しない → Switch B に届かない
+
+**修正: bridge ポートの MAC learning 無効化**
+```
+bridge link set dev relay-br learning off
+bridge link set dev gretap1 learning off
+```
+- learning off → すべてのフレームが全ポートにフラッディング
+- bridge ポートが 2 つのみ (relay-br + gretap1) → フレームは到着ポートに戻らないためループなし
+- Switch A → ldn → tc mirred → bridge → gretap1 → tunnel → Switch B (ユニキャストも通過)
+
+**Switch B の participant index:**
+- index 1 (IP .2, PC A と同一) に戻す
+- MAC 書き換え (ldn IF managed mode) + 同一 IP により、
+  Switch A の Pia は Switch B の通信を PC A からのものとして認識
+- index 2 (IP .3) では Switch A の participant list に .3 が存在せず Pia が reject
+
+**TAP IP:**
+- .254 を維持 (旧 .1 ではなく)
+- .1 = Switch A の IP → TAP が ARP を横取りしてトンネル経由の通信を阻害
+- .254 は participant IP 範囲外で安全
+
+#### bridge+tc mirred 改良版 実装 (2026-02-23)
+
+routing+NAT コードを全廃止し、bridge+tc mirred に回帰 + MAC learning 無効化を追加。
+
+**tunnel_node.py 変更内容:**
+
+1. **`setup_tunnel_primary` / `setup_tunnel_secondary` → 共用 `setup_tunnel`**
+   - Primary/Secondary 両方が gretap1 + br-ldn を使用
+   - routing+NAT では Primary が gretap1 standalone だったが廃止
+
+2. **`setup_primary_routing` → `setup_station_relay` 復元 + MAC learning 無効化**
+   - veth pair (relay-sta ↔ relay-br) + tc mirred redirect を復元
+   - 新規: `bridge link set dev relay-br learning off` + `bridge link set dev gretap1 learning off`
+   - routing+NAT の proxy_arp / ip_forward / MASQUERADE / FORWARD / policy routing を全廃止
+
+3. **`teardown_primary` / `teardown_secondary` → 共用 `teardown_tunnel`**
+   - tc qdisc del + veth 削除 + bridge 削除 + gretap1 削除
+
+4. **`_register_participant` index 範囲: `range(2, 8)` → `range(1, 8)` に復元**
+   - Switch B を index 1 (IP .2) に配置 = PC A と同一 IP
+   - Switch A の Pia が PC A からの通信として認識する
+
+5. **TAP IP .254 は維持** (routing+NAT で導入、有効なため継続)
+
+6. **`run_primary` / `run_secondary` 更新**
+   - `setup_tunnel_primary` → `setup_tunnel` + `setup_station_relay`
+   - `teardown_primary("ldn", network_id)` → `teardown_tunnel()`
+   - `setup_tunnel_secondary` → `setup_tunnel`
+   - `teardown_secondary()` → `teardown_tunnel()`
+
+7. **`cleanup_stale_interfaces` の iptables 清掃は維持** (routing+NAT 残骸対策)
 
 ---
 
