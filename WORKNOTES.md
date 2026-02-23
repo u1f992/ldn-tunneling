@@ -796,6 +796,45 @@ Switch B のパケットが ldn-tap に到着するが、gretap1 に転送され
    - Secondary が Primary からの ACCEPT メッセージを処理していなかった
    - `network.set_accept_policy(msg["policy"])` で AP のポリシーを同期
 
+### テスト 7: 「しばらくお待ちください」が異常に長い — gretap MTU ドロップ
+
+**症状:**
+- Primary 側では早々に Secondary のアバターが表示される
+- Secondary 側で「しばらくお待ちください」待機が異常に長い
+- ゲーム選択の検証に至れない
+
+**tcpdump 分析:**
+- `a-tcpdump-ldn.log`: **3323** 個の大きいパケット (≥1422 bytes) — Switch A からの Pia データ
+- `a-tcpdump-gretap1.log`: **0** 個 — 全てドロップ
+- `b-tcpdump-gretap1.log`: **0** 個
+- `b-tcpdump-ldn-tap.log`: **23** 個 — Switch B 自身の送信パケット (これも gretap1 でドロップ)
+
+**根本原因: gretap1 MTU 1400**
+- gretap1 の MTU を 1400 に設定したため、bridge が 1400 byte 超の L3 payload を持つフレームをドロップ
+- 1422 byte frame = 14 byte Ethernet header + 1408 byte payload → 1408 > 1400 → DROPPED
+- 1470 byte frame = 14 byte Ethernet header + 1456 byte payload → 1456 > 1400 → DROPPED
+- Switch A が送る Pia ゲームデータの大半 (3323 パケット) が Secondary に到達しない
+- Switch B の大きいパケット (23 個) も Primary に到達しない
+
+**修正:**
+```python
+# gretap 作成時に nopmtudisc を指定し、外側 IP パケットの断片化を許可
+run(["ip", "link", "add", "gretap1", "type", "gretap",
+     "local", local_ip, "remote", remote_ip, "key", "1",
+     "nopmtudisc"])
+# MTU を 1500 に設定 — 標準 Ethernet フレームを全て通す
+run(["ip", "link", "set", "gretap1", "mtu", "1500"])
+```
+
+**技術的背景:**
+- gretap 外側オーバーヘッド: IP(20) + GRE(4) + GRE key(4) = 28 bytes
+- WireGuard MTU 1420 の場合、gretap の適正 MTU = 1420 - 28 = 1392
+- しかし Switch は最大 1470 byte のフレーム (1456 byte payload) を送信
+- 1456 > 1392 → MTU を正しく設定しても大きいパケットはドロップされる
+- **解決策: `nopmtudisc`** — 外側 IP パケットに DF ビットを設定しない
+  - 1470 byte 内部フレーム → 1498 byte 外側 IP → WireGuard で断片化 → リモートで再組み立て
+  - 断片化のオーバーヘッドはあるが、パケットドロップより遥かに良い
+
 ---
 
 ## ログ
