@@ -655,6 +655,33 @@ tcpdump 分析で 3 つの問題を特定:
    - `handle_peer_messages_primary`: LEAVE で break せず、ログ記録のみ
    - TCP 切断時のみ return → nursery cancel
 
+### v4 テスト結果 (2回目): Station was disassociated
+
+- Primary: `ConnectionError: Station was disassociated` at `__init__.py:1383`
+- 802.11 接続は成功したが、LDN 認証中に AP (Switch A) が STA を disassociate
+- 仮説: 同一チャネル (ch 11) で Secondary AP と Switch A の AP が動作
+  → Switch A が同一 MAC を検出して disassociate
+- 修正: `pick_secondary_channel()` で非重複チャネルを選択
+
+### v4 テスト結果 (3回目): Connect failed with status code 1
+
+- Primary: `ConnectionError: Connect failed with status code 1` (WLAN_STATUS_UNSPECIFIED_FAILURE)
+- Secondary: `BrokenPipeError` (Primary TCP 切断の結果)
+- チャネル分離後も失敗。エラーレベルが LDN 認証 → 802.11 接続に退行
+- tcpdump: 全インターフェースでゲームトラフィック 0 件。`a-tcpdump-ldn.log` = "No such device exists"
+- Switch A の AP が Association Response で status 1 を返している
+
+**分析:**
+2回のテストで異なるエラーモード (disassociation vs connect failure) が出現。
+MAC スプーフ接続が不安定な原因として最も可能性が高いのは **scan → connect 間のタイムラグ**:
+- scan 時点の NetworkInfo (server_random 等) が数分後の connect 時に古くなっている可能性
+- solo mode は scan 直後に connect するため成功する
+- v4 は tunnel 構築 + Secondary 待機 + Switch B JOIN 待機の間に分単位の遅延が発生
+
+**修正: connect 直前に再スキャン + リトライ**
+- `run_primary()` で connect 前に `scan_mk8dx()` を再実行して最新の NetworkInfo を取得
+- ConnectionError 発生時は最大 3 回リトライ (2 秒間隔、毎回再スキャン)
+
 ---
 
 ## ログ

@@ -616,52 +616,82 @@ async def run_primary(args):
             print()
 
             # 6. Switch B の MAC で Switch A の AP に STA 接続
+            #    scan 結果は数分前の可能性があるため、connect 直前に再スキャンする
             print("=== 5. Connecting to Switch A with Switch B's MAC ===")
             param = ldn.ConnectNetworkParam()
             param.keys = keys
             param.phyname = args.phy
-            param.network = info
             param.password = MK8DX_PASSWORD
             param.name = bytes.fromhex(switch_b_name) if switch_b_name else b"LDN-Tunnel"
             param.address = ldn.MACAddress(switch_b_mac)
 
-            async with ldn.connect(param) as sta:
-                sta_index = sta._participant_id
-                sta_ip = sta.participant().ip_address
-                print(f"  Connected as STA (participant {sta_index})")
-                print(f"  IP: {sta_ip}")
-                print(f"  MAC: {switch_b_mac} (spoofed)")
-                print()
+            max_connect_attempts = 3
+            for attempt in range(max_connect_attempts):
+                if attempt > 0:
+                    print(f"\n  Retry {attempt + 1}/{max_connect_attempts}"
+                          f" in 2 seconds...")
+                    await trio.sleep(2)
 
-                # 6a. CONNECTED 通知 → Secondary に IP/index を同期
-                await send_msg(peer_stream, {
-                    "type": "connected",
-                    "index": sta_index,
-                    "ip": sta_ip,
-                })
-                print(f"  CONNECTED sent (idx={sta_index}, ip={sta_ip})")
+                # Re-scan for fresh NetworkInfo
+                print("  Re-scanning for fresh NetworkInfo...")
+                fresh_info = await scan_mk8dx(keys, args.phy)
+                if fresh_info is None:
+                    print("  Network not found!")
+                    continue
+                param.network = fresh_info
 
-                # 7. Relay 構築
-                print("=== 6. Setting up relay ===")
-                setup_station_relay()
-                print()
+                try:
+                    async with ldn.connect(param) as sta:
+                        sta_index = sta._participant_id
+                        sta_ip = sta.participant().ip_address
+                        print(f"  Connected as STA"
+                              f" (participant {sta_index})")
+                        print(f"  IP: {sta_ip}")
+                        print(f"  MAC: {switch_b_mac} (spoofed)")
+                        print()
 
-                print("=== Ready ===")
-                print("Pia 通信が透過的にリレーされます")
-                print("Ctrl+C で終了")
-                print()
+                        # 6a. CONNECTED 通知 → Secondary に IP/index を同期
+                        await send_msg(peer_stream, {
+                            "type": "connected",
+                            "index": sta_index,
+                            "ip": sta_ip,
+                        })
+                        print(f"  CONNECTED sent"
+                              f" (idx={sta_index}, ip={sta_ip})")
 
-                # 8. Event loop
-                async with trio.open_nursery() as nursery:
-                    nursery.start_soon(
-                        handle_primary_events,
-                        sta, peer_stream, switch_b_mac)
+                        # 7. Relay 構築
+                        print("=== 6. Setting up relay ===")
+                        setup_station_relay()
+                        print()
 
-                    async def _wait_secondary(reader=reader):
-                        await handle_peer_messages_primary(reader)
-                        nursery.cancel_scope.cancel()
+                        print("=== Ready ===")
+                        print("Pia 通信が透過的にリレーされます")
+                        print("Ctrl+C で終了")
+                        print()
 
-                    nursery.start_soon(_wait_secondary)
+                        # 8. Event loop
+                        async with trio.open_nursery() as nursery:
+                            nursery.start_soon(
+                                handle_primary_events,
+                                sta, peer_stream, switch_b_mac)
+
+                            async def _wait_secondary(
+                                reader=reader,
+                            ):
+                                await handle_peer_messages_primary(
+                                    reader)
+                                nursery.cancel_scope.cancel()
+
+                            nursery.start_soon(_wait_secondary)
+
+                        # Event loop 正常終了 → retry 不要
+                        break
+                except ConnectionError as e:
+                    print(f"  Connect failed: {e}")
+                    if attempt < max_connect_attempts - 1:
+                        print("  Will retry with fresh scan...")
+                        continue
+                    raise
 
         finally:
             for listener in listeners:
