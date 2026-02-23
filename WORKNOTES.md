@@ -583,6 +583,10 @@ v3 の根本的限界 (Pia がPC A を認識できない) を解決するため�
 
 ### v4 ldn ライブラリ変更 (MAC スプーフ)
 
+**フォーク:** https://github.com/u1f992/LDN.git (upstream: kinnay/LDN v0.0.16)
+- `pyproject.toml` でコミットハッシュ指定 → `uv sync` で展開。手動パッチ不要
+- ライブラリの修正が必要な場合はこのフォークを操作し、コミットハッシュを更新する
+
 kinnay/LDN v0.0.16 に以下の最小変更を追加:
 
 **1. `wlan.py` — `Factory.connect_network()` に `address` パラメータ追加**

@@ -46,12 +46,11 @@ wheels = [
 [[package]]
 name = "ldn"
 version = "0.0.16"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/u1f992/LDN.git?rev=f475645ff4c660a2ee5250901ec43a35ef9fc2d5#f475645ff4c660a2ee5250901ec43a35ef9fc2d5" }
 dependencies = [
     { name = "pycryptodome" },
     { name = "python-netlink" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f7/e3/28d91a717fbf9215823719d0abd08635365d3b5de5223725b9ae5c01c35a/ldn-0.0.16.tar.gz", hash = "sha256:9b38677428d6cba887b6a35953beb448d2c86de26ee81ca30f2d1a0ab26d295e", size = 40744, upload-time = "2026-02-13T16:36:56.305Z" }
 
 [[package]]
 name = "ldn-tunneling"
@@ -62,7 +61,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "ldn", specifier = ">=0.0.16" }]
+requires-dist = [{ name = "ldn", git = "https://github.com/u1f992/LDN.git?rev=f475645ff4c660a2ee5250901ec43a35ef9fc2d5" }]
 
 [[package]]
 name = "outcome"
