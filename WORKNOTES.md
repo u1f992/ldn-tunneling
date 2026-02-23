@@ -33,7 +33,7 @@
 
 ### Step 2: LDNスキャンテスト ★完了
 - [x] NetworkManagerからA6210を解放
-- [x] rfkill unblock 2 (ソフトブロック解除が必要だった)
+- [x] rfkill list, rfkill unblock 2 (ソフトブロック解除が必要だった)
 - [x] prod.keys を用意（master_key_00〜05, aes_kek/key_generation_source）
 - [x] マリオカート8DXのローカル通信で部屋作成
 - [x] スキャン成功: MAC 5C:52:1E:EA:EB:9E, GameID 0x0100152000022000, ch1, proto=1, ver=4
