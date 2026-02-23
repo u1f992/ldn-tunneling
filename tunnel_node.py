@@ -33,7 +33,7 @@ import ldn
 # --- Constants ---
 
 MK8DX_GAME_ID = 0x0100152000022000
-MK8DX_PASSWORD = b"MarioKart8Delux" + b"\x00" * 17
+MK8DX_PASSWORD = b"MarioKart8Delux" + b"\x00" * 17  # https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases
 
 CONTROL_PORT = 39571
 

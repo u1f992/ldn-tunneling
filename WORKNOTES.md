@@ -887,6 +887,91 @@ run(["ip", "link", "set", "ldn-mon", "mtu", "2304"])
 4. **テスト 8 → 9**: ldn-mon MTU 2304
    - 802.11 変換後フレームの EMSGSIZE を解消
 
+## 複数プレイヤー対応に向けて
+
+### 背景
+現在の v4 アーキテクチャは 2 プレイヤー (Switch A: Host + Switch B: Remote) を前提としている。
+MK8DX は最大 8 プレイヤーのローカル通信に対応しており、将来的にマルチプレイヤーを扱いたい。
+
+### ボトルネック: Switch A の AP への複数 MAC スプーフ STA 接続
+
+現在、Primary (PC A) は Switch B の MAC をスプーフして Switch A の AP に STA 接続する。
+Switch A は **802.11 で自分の AP に associate した STA しか参加者として認識しない**ため、
+リモート Switch が N 台いれば N 個の MAC スプーフ STA 接続が必要になる。
+
+しかし mt76x2u のハードウェア制約は `{managed, AP, mesh, P2P} <= 2, total <= 2, 1チャネル` であり、
+1 本のアダプタでは STA を 1 つしか作れない。
+また Pia の AES-GCM nonce に送信元 MAC が含まれるため、
+1 つの STA に複数リモート Switch のトラフィックを多重化することも不可能。
+
+### 方式: 複数 USB アダプタ (Primary 側のみ)
+
+Primary に A6210 を **リモート Switch の台数ぶん** 接続し、
+それぞれ独立した STA として Switch A の AP に参加させる。
+
+- **Primary (PC A):** A6210 × N 本 (リモート Switch ごとに 1 本、各々異なる MAC でスプーフ)
+- **Secondary (PC B, C, ...):** A6210 × 1 本ずつ (プロキシ AP をホスト、複数 Switch が参加可能)
+
+```
+拠点A                                    拠点B
+  Switch A (Host)                          Switch B, F, G, H
+  Switch C, D, E (直接参加)                    ↕ WiFi
+       ↕ WiFi                              PC B (Secondary): A6210 ×1
+  PC A (Primary):
+    A6210 #1 → Switch B MAC でSTA
+    A6210 #2 → Switch F MAC でSTA         拠点C
+    A6210 #3 → Switch G MAC でSTA           Switch I
+    A6210 #4 → Switch H MAC でSTA              ↕ WiFi
+       ↕ VXLAN/GRETAP over WireGuard      PC C (Secondary): A6210 ×1
+```
+
+**なぜ Secondary は 1 本で済むか:**
+Secondary は `ldn.create_network()` でプロキシ AP をホストする。
+LDN AP は最大 7 クライアント (participant index 1-7) を受け入れられるので、
+1 つの AP に複数の Switch が直接 WiFi 参加できる。
+`patch_secondary_network` の `_register_participant` パッチも既に index 1-7 を走査しており、
+複数参加者の割り当ては対応済み。
+
+### コード上の変更箇所
+
+| 箇所 | 現状 | 変更内容 |
+|------|------|----------|
+| `--switch-b-mac` | 1 個 | リモート MAC のリスト (`--remote-macs MAC1,MAC2,...`) |
+| `--remote` | 1 IP | 複数 Secondary の IP リスト、または VXLAN 化 |
+| `--phy` | 1 つ | Primary: phy のリスト (アダプタごと) |
+| `setup_tunnel()` | GRETAP × 1 本 | GRETAP × N 本 (各 Secondary 向け) or VXLAN |
+| `run_primary()` STA 接続 | `ldn.connect()` × 1 | phy ごとに `ldn.connect()` × N |
+| `setup_station_relay()` | veth + tc mirred × 1 | STA ごとに veth + tc mirred、全て br-ldn に接続 |
+| TCP accept | 1 回のみ | accept loop で N 本の Secondary 接続を管理 |
+| `handle_primary_events()` | `relay_mac` 1 つ | スプーフ MAC の set でフィルタ |
+| `handle_peer_messages_primary()` | JOIN を無視 | JOIN/LEAVE を全 Secondary にブロードキャスト |
+
+### L2 トンネルの選択肢
+
+| 方式 | 概要 |
+|------|------|
+| GRETAP × N 本 | Secondary ごとに `gretap1`, `gretap2`, ... を作成し br-ldn に追加。シンプル |
+| VXLAN | 単一インターフェースで全 peer をカバー。FDB エントリで head-end replication。拡張性◎ |
+
+MAC learning 無効化 (現在も実施済み) により、br-ldn 上の全ポートにフラッディングされる。
+ポート数が増えても動作原理は同じ。
+
+### 懸念事項
+
+- **co-channel interference:** 複数アダプタが同一 2.4GHz チャネルで同時送受信する。
+  802.11 CSMA/CA で衝突回避されるはずだが、物理的に近いアダプタ同士の干渉は未検証。
+  USB 延長ケーブルで物理的に離す等の対策が有効な可能性あり
+- **USB 帯域:** A6210 は USB 3.0 だが、複数挿した場合のホストコントローラ帯域共有
+- **A6210 の入手性:** 同一チップ (MT7612U) の他製品 (ELECOM 等) は
+  2.4GHz PA 未搭載で使用不可と判明済み。A6210 の追加調達が必要
+
+### 推奨ステップ
+
+1. **まず 2 拠点 × 2 人 + α** — PC A に A6210 を 2 本接続し、リモート 2 台の STA 接続を検証。
+   co-channel interference と USB 共存の実動作を確認する
+2. 動作確認後、制御チャネルの多 Secondary 対応と VXLAN 化を実装
+3. 段階的にリモート台数を増やして安定性を検証
+
 ---
 
 ## ログ
