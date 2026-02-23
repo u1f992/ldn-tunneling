@@ -1,16 +1,24 @@
-"""LDN Tunnel Node v3 — Phase 2 (非対称 STA + AP)
+"""LDN Tunnel Node v4 — MAC スプーフ STA リレー
 Usage:
   Primary:   sudo .venv/bin/python tunnel_node.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1
   Secondary: sudo .venv/bin/python tunnel_node.py prod.keys --role secondary --local <wg_ip> --remote <wg_ip> --phy phy1
   Solo test: sudo .venv/bin/python tunnel_node.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1 --solo
 
-v3 非対称アーキテクチャ:
-  Primary (PC A):   ldn.connect() で Switch A の LDN 部屋に STA として参加。
-                    station IF を veth+tc mirred で bridge 経由で GRETAP トンネルに接続。
-                    MAC learning 無効化でブロードキャスト・ユニキャスト両方をフラッディング。
+v4 MAC スプーフリレーアーキテクチャ:
+  Primary (PC A):   Switch B の MAC で Switch A の AP に STA 接続。
+                    Switch A は Switch B が直接参加したと認識する。
+                    Pia の AES-GCM nonce (CRC32 に MAC を含む) が一致し、
+                    暗号化通信が透過的に成立する。
   Secondary (PC B): ldn.create_network() で Switch A の部屋を複製した AP をホスト。
                     participant 0 を Switch A の情報に書き換え、
                     Switch B から見て Switch A がホストに見える。
+
+  フロー:
+    1. Primary: scan → NETWORK 情報取得 (STA 接続はまだしない)
+    2. Primary: tunnel + bridge 構築 → Secondary 接続待機
+    3. Secondary: AP 作成 → Switch B 参加 → JOIN (MAC) を Primary に送信
+    4. Primary: Switch B の MAC で STA 接続 → relay 構築
+    5. Pia 通信が Switch A ↔ relay ↔ tunnel ↔ Switch B で透過的に成立
 """
 
 import argparse
@@ -52,7 +60,7 @@ def cleanup_stale_interfaces():
     for ifname in ["ldn-tap", "relay-sta", "br-ldn", "gretap1"]:
         run_quiet(["ip", "link", "del", ifname])
     run_quiet(["tc", "qdisc", "del", "dev", "ldn", "ingress"])
-    # iptables / policy routing (Primary の routing+NAT 残骸)
+    # iptables / policy routing 残骸
     run_quiet(["iptables", "-t", "nat", "-F", "POSTROUTING"])
     run_quiet(["iptables", "-F", "FORWARD"])
     run_quiet(["ip", "rule", "del", "table", "100"])
@@ -80,10 +88,6 @@ def setup_station_relay(ifname="ldn"):
     MAC learning を無効化し、全フレームをフラッディングさせる。
     bridge ポートが 2 つ (relay-br + gretap1) のみなので、
     フレームは到着ポート以外の全ポート (= もう 1 つ) に転送される。ループなし。
-
-    パケット経路:
-      受信: Switch A → [station IF] →(tc)→ [relay-sta] →(veth)→ [relay-br] → bridge → gretap1
-      送信: gretap1 → bridge → [relay-br] →(veth)→ [relay-sta] →(tc)→ [station IF] → Switch A
     """
     # veth pair 作成
     run(["ip", "link", "add", "relay-sta", "type", "veth",
@@ -95,8 +99,6 @@ def setup_station_relay(ifname="ldn"):
     run(["ip", "link", "set", "relay-br", "master", "br-ldn"])
 
     # MAC learning 無効化 — 全フレームをフラッディング
-    # learning が有効だと、bridge が PC A の MAC を relay-br ポートで学習し、
-    # Switch A → PC A 宛てユニキャストが relay-br に戻されて gretap1 に到達しない
     run(["bridge", "link", "set", "dev", "relay-br", "learning", "off"])
     run(["bridge", "link", "set", "dev", "gretap1", "learning", "off"])
 
@@ -137,8 +139,8 @@ def add_tap_to_bridge():
 def patch_secondary_network(network, net_msg):
     """Secondary の APNetwork を Switch A のプロキシとしてパッチする。
 
-    1. _network_id を Switch A のサブネット ID に統一 (__init__.py:1512)
-    2. participant 0 を Switch A の情報に書き換え (__init__.py:1514-1521)
+    1. _network_id を Switch A のサブネット ID に統一
+    2. participant 0 を Switch A の情報に書き換え
     3. TAP IP を .254 に設定 — Switch A の IP (.1) を横取りしない
     4. _register_participant を index 1+ に制限 — index 0=Switch A
     """
@@ -157,8 +159,6 @@ def patch_secondary_network(network, net_msg):
     p0.platform = host["platform"]
 
     # 3. TAP IP を .254 に設定
-    #    .1 = Switch A の IP。TAP に .1 を使うと Switch A 宛て ARP/通信を
-    #    横取りしてしまう。.254 は participant IP 範囲外で安全。
     subprocess.run(["ip", "addr", "flush", "dev", "ldn-tap"], check=True)
     subprocess.run(["ip", "addr", "add",
                     f"169.254.{network_id}.254/24",
@@ -203,11 +203,7 @@ def patch_secondary_network(network, net_msg):
 
 
 def inject_virtual_participant(network, index, ip, mac_str, name, app_version, platform):
-    """対向拠点の参加者を仮想参加者としてアドバタイズメントに注入する。
-
-    APNetwork._network.participants[index] に直接書き込み、
-    _update_nonce() でアドバタイズメント更新をトリガーする (__init__.py:1675)。
-    """
+    """対向拠点の参加者を仮想参加者としてアドバタイズメントに注入する。"""
     participant = ldn.ParticipantInfo()
     participant.ip_address = ip
     participant.mac_address = ldn.MACAddress(mac_str)
@@ -261,16 +257,18 @@ async def recv_msg(reader):
 
 # --- Message builders ---
 
-def make_network_msg(sta):
-    """STANetwork の全状態を NETWORK メッセージに変換する。
+def make_network_msg_from_scan(info):
+    """scan 結果の NetworkInfo を NETWORK メッセージに変換する。
 
-    Primary → Secondary: Switch A の部屋の全情報を送信。
-    Secondary はこれを基に APNetwork を構築し、Switch A の部屋を複製する。
+    scan() が返す NetworkInfo は advertisement frame を解析した結果であり、
+    STA 接続せずに全情報を取得できる。
     """
-    net = sta._network
+    # network_id: host の IP (169.254.X.1) から X を抽出
+    host_ip = info.participants[0].ip_address
+    network_id = int(host_ip.split(".")[2])
+
     participants = []
-    for i in range(8):
-        p = net.participants[i]
+    for i, p in enumerate(info.participants):
         participants.append({
             "index": i,
             "ip": p.ip_address,
@@ -280,22 +278,33 @@ def make_network_msg(sta):
             "app_version": p.app_version,
             "platform": p.platform,
         })
+    # 8 エントリに満たない場合はパディング
+    for i in range(len(info.participants), 8):
+        participants.append({
+            "index": i,
+            "ip": "",
+            "mac": "00:00:00:00:00:00",
+            "connected": False,
+            "name": "",
+            "app_version": 0,
+            "platform": 0,
+        })
 
     return {
         "type": "network",
-        "network_id": sta._network_id,
-        "local_communication_id": net.local_communication_id,
-        "scene_id": net.scene_id,
-        "channel": net.channel,
-        "protocol": net.protocol,
-        "version": net.version,
-        "app_version": net.app_version,
-        "max_participants": net.max_participants,
-        "security_mode": net.security_mode,
-        "accept_policy": net.accept_policy,
-        "application_data": net.application_data.hex(),
-        "server_random": net.server_random.hex(),
-        "ssid": net.ssid.hex(),
+        "network_id": network_id,
+        "local_communication_id": info.local_communication_id,
+        "scene_id": info.scene_id,
+        "channel": info.channel,
+        "protocol": info.protocol,
+        "version": info.version,
+        "app_version": info.app_version,
+        "max_participants": info.max_participants,
+        "security_mode": info.security_mode,
+        "accept_policy": info.accept_policy,
+        "application_data": info.application_data.hex(),
+        "server_random": info.server_random.hex(),
+        "ssid": info.ssid.hex(),
         "participants": participants,
     }
 
@@ -357,22 +366,22 @@ async def scan_mk8dx(keys, phy):
 
 # --- Event handling ---
 
-async def handle_primary_events(sta, peer_stream):
+async def handle_primary_events(sta, peer_stream, relay_mac):
     """Primary: STANetwork のイベントを監視し、制御チャネルで Secondary に転送する。
 
-    STANetwork._monitor_network (__init__.py:1421-1462) が生成するイベント:
-    - JoinEvent/LeaveEvent: Switch A の部屋の参加者変更
-    - ApplicationDataChanged: ゲーム状態の更新 (ロビー、コース選択等)
-    - AcceptPolicyChanged: 参加受付ポリシーの変更
-    - DisconnectEvent: Switch A との接続断
-
-    peer_stream への書き込み失敗は Secondary 切断を意味するので静かに終了する。
+    relay_mac: 自身の STA MAC (= Switch B の MAC)。
+    自分自身の JoinEvent はフィルタして Secondary に転送しない。
     """
     try:
         while True:
             event = await sta.next_event()
             if isinstance(event, ldn.JoinEvent):
                 p = event.participant
+                # 自身の参加イベントはスキップ
+                if str(p.mac_address) == relay_mac:
+                    print(f"  [PRIMARY JOIN] idx={event.index}"
+                          f" (self, skipping relay)")
+                    continue
                 print(f"  [PRIMARY JOIN] idx={event.index}"
                       f" {p.name.decode(errors='replace')}"
                       f" IP={p.ip_address} MAC={p.mac_address}")
@@ -421,11 +430,11 @@ async def handle_secondary_events(network, peer_stream):
             await send_msg(peer_stream, make_leave_msg(event.index))
 
 
-async def handle_peer_messages_primary(sta, reader):
-    """Primary: Secondary からの JOIN/LEAVE を受信してログに記録する。
+async def handle_peer_messages_primary(reader):
+    """Primary: Secondary からの LEAVE を受信してログに記録する。
 
-    STANetwork はアドバタイズメントを制御できないため、
-    仮想参加者の注入はできない。ログ記録のみ。
+    初期 JOIN は run_primary() で処理済み。
+    LEAVE を受信したら接続を終了する。
     """
     while True:
         try:
@@ -434,20 +443,18 @@ async def handle_peer_messages_primary(sta, reader):
             print("  [CTRL] Secondary disconnected")
             break
 
-        if msg["type"] == "join":
-            print(f"  [REMOTE JOIN] idx={msg['index']}"
-                  f" IP={msg['ip']} MAC={msg['mac']}")
-        elif msg["type"] == "leave":
+        if msg["type"] == "leave":
             print(f"  [REMOTE LEAVE] idx={msg['index']}")
+            break
+        elif msg["type"] == "join":
+            # 追加の参加者 (将来対応)
+            print(f"  [REMOTE JOIN] idx={msg['index']}"
+                  f" IP={msg['ip']} MAC={msg['mac']}"
+                  f" (additional participant, not yet supported)")
 
 
 async def handle_peer_messages_secondary(network, reader):
-    """Secondary: Primary からの JOIN/LEAVE/APP_DATA/ACCEPT を処理する。
-
-    - JOIN/LEAVE: Switch A 側の参加者変更 → 仮想参加者として注入/除去
-    - APP_DATA: ゲーム状態の更新 → APNetwork に反映
-    - ACCEPT: 参加受付ポリシーの変更 → APNetwork に反映
-    """
+    """Secondary: Primary からの JOIN/LEAVE/APP_DATA/ACCEPT を処理する。"""
     while True:
         try:
             msg = await recv_msg(reader)
@@ -484,7 +491,7 @@ async def run_primary(args):
     keys = ldn.load_keys(args.keys)
     cleanup_stale_interfaces()
 
-    # 1. Scan
+    # 1. Scan (STA 接続はしない — scan 結果から全情報を取得)
     print("=== 1. Scan for MK8DX ===")
     print("Switch A でローカル通信の部屋を作ってください")
     print()
@@ -493,32 +500,29 @@ async def run_primary(args):
         print("MK8DX network not found.")
         return
 
+    host = info.participants[0]
+    host_ip = host.ip_address
+    network_id = int(host_ip.split(".")[2])
     print(f"\n  ch={info.channel} proto={info.protocol} ver={info.version}"
           f" app_ver={info.app_version}")
     print(f"  BSSID={info.address}")
+    print(f"  Host: IP={host_ip} MAC={host.mac_address}")
+    print(f"  network_id={network_id}")
     print()
 
-    # 2. Connect as STA
-    print("=== 2. Connecting to Switch A's LDN network ===")
-    param = ldn.ConnectNetworkParam()
-    param.keys = keys
-    param.phyname = args.phy
-    param.network = info
-    param.password = MK8DX_PASSWORD
-    param.name = b"LDN-Tunnel"
+    if args.solo:
+        # Solo mode: 従来通り PC A の MAC で接続して監視
+        print("=== 2. Solo: Connecting as STA ===")
+        param = ldn.ConnectNetworkParam()
+        param.keys = keys
+        param.phyname = args.phy
+        param.network = info
+        param.password = MK8DX_PASSWORD
+        param.name = b"LDN-Tunnel"
 
-    async with ldn.connect(param) as sta:
-        net = sta._network
-        print(f"  Connected as STA (participant {sta._participant_id})")
-        print(f"  network_id: {sta._network_id}")
-        print(f"  IP: {sta.participant().ip_address}")
-        print(f"  Host (Switch A): IP={net.participants[0].ip_address}"
-              f" MAC={net.participants[0].mac_address}")
-        print()
-
-        if args.solo:
-            # Solo mode: STA 参加の確認のみ
-            print("=== Solo mode: monitoring events ===")
+        async with ldn.connect(param) as sta:
+            print(f"  Connected (participant {sta._participant_id})")
+            print(f"  IP: {sta.participant().ip_address}")
             print("Ctrl+C で終了")
             print()
             while True:
@@ -539,73 +543,97 @@ async def run_primary(args):
                 elif isinstance(event, ldn.DisconnectEvent):
                     print(f"  [DISCONNECT] reason={event.reason}")
                     break
-        else:
-            # Full mode: tunnel + bridge + relay + control channel
-            print("=== 3. GRETAP tunnel + bridge ===")
-            setup_tunnel(args.local, args.remote)
+        return
+
+    # 2. GRETAP tunnel + bridge (STA 接続前に構築)
+    print("=== 2. GRETAP tunnel + bridge ===")
+    setup_tunnel(args.local, args.remote)
+    print()
+
+    try:
+        # 3. Secondary 待機
+        listeners = await trio.open_tcp_listeners(
+            CONTROL_PORT, host=args.local)
+        try:
+            print(f"=== 3. Waiting for secondary on port {CONTROL_PORT} ===")
+            print(f"  Listening on {args.local}:{CONTROL_PORT}")
+
+            peer_stream = await listeners[0].accept()
+            reader = LineReader(peer_stream)
+            print("  Secondary connected!")
+
+            # 4. NETWORK 送信 (scan 結果から)
+            net_msg = make_network_msg_from_scan(info)
+            await send_msg(peer_stream, net_msg)
+            print("  NETWORK sent, waiting for READY...")
+
             try:
+                ready_msg = await recv_msg(reader)
+            except (trio.ClosedResourceError, trio.EndOfChannel):
+                print("  Secondary disconnected before READY")
+                return
+            assert ready_msg["type"] == "ready", \
+                f"Expected 'ready', got {ready_msg}"
+            print("  Secondary is ready!")
+            print()
+
+            # 5. Switch B の JOIN を待機
+            print("=== 4. Waiting for Switch B to join ===")
+            print("Switch B で「ローカル通信」から参加してください")
+            print()
+
+            join_msg = await recv_msg(reader)
+            assert join_msg["type"] == "join", \
+                f"Expected 'join', got {join_msg}"
+            switch_b_mac = join_msg["mac"]
+            switch_b_name = join_msg.get("name", "")
+            print(f"  Switch B joined! MAC={switch_b_mac}")
+            print()
+
+            # 6. Switch B の MAC で Switch A の AP に STA 接続
+            print("=== 5. Connecting to Switch A with Switch B's MAC ===")
+            param = ldn.ConnectNetworkParam()
+            param.keys = keys
+            param.phyname = args.phy
+            param.network = info
+            param.password = MK8DX_PASSWORD
+            param.name = bytes.fromhex(switch_b_name) if switch_b_name else b"LDN-Tunnel"
+            param.address = ldn.MACAddress(switch_b_mac)
+
+            async with ldn.connect(param) as sta:
+                print(f"  Connected as STA (participant {sta._participant_id})")
+                print(f"  IP: {sta.participant().ip_address}")
+                print(f"  MAC: {switch_b_mac} (spoofed)")
+                print()
+
+                # 7. Relay 構築
+                print("=== 6. Setting up relay ===")
                 setup_station_relay()
                 print()
 
-                # TCP listener — セカンダリ再接続のため開き続ける
-                listeners = await trio.open_tcp_listeners(
-                    CONTROL_PORT, host=args.local)
-                try:
-                    while True:
-                        print(f"=== 4. Waiting for secondary on port"
-                              f" {CONTROL_PORT} ===")
-                        print(f"  Listening on"
-                              f" {args.local}:{CONTROL_PORT}")
+                print("=== Ready ===")
+                print("Pia 通信が透過的にリレーされます")
+                print("Ctrl+C で終了")
+                print()
 
-                        peer_stream = await listeners[0].accept()
-                        reader = LineReader(peer_stream)
-                        print("  Secondary connected!")
+                # 8. Event loop
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(
+                        handle_primary_events,
+                        sta, peer_stream, switch_b_mac)
 
-                        # Send NETWORK message
-                        net_msg = make_network_msg(sta)
-                        await send_msg(peer_stream, net_msg)
-                        print("  NETWORK sent, waiting for READY...")
+                    async def _wait_secondary(reader=reader):
+                        await handle_peer_messages_primary(reader)
+                        nursery.cancel_scope.cancel()
 
-                        try:
-                            ready_msg = await recv_msg(reader)
-                        except (trio.ClosedResourceError,
-                                trio.EndOfChannel):
-                            print("  Secondary disconnected"
-                                  " before READY")
-                            continue
-                        assert ready_msg["type"] == "ready", \
-                            f"Expected 'ready', got {ready_msg}"
-                        print("  Secondary is ready!")
-                        print()
+                    nursery.start_soon(_wait_secondary)
 
-                        print("=== Ready ===")
-                        print("Switch B で「ローカル通信」"
-                              "から参加してください")
-                        print("Ctrl+C で終了")
-                        print()
+        finally:
+            for listener in listeners:
+                await listener.aclose()
 
-                        async with trio.open_nursery() as nursery:
-                            nursery.start_soon(
-                                handle_primary_events,
-                                sta, peer_stream)
-
-                            async def _wait_secondary(
-                                    reader=reader):
-                                await handle_peer_messages_primary(
-                                    sta, reader)
-                                nursery.cancel_scope.cancel()
-
-                            nursery.start_soon(_wait_secondary)
-
-                        print()
-                        print("  Secondary disconnected,"
-                              " accepting reconnection...")
-                finally:
-                    for listener in listeners:
-                        await listener.aclose()
-
-            finally:
-                teardown_tunnel()
+    finally:
+        teardown_tunnel()
 
 
 async def run_secondary(args):
@@ -670,11 +698,11 @@ async def run_secondary(args):
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="LDN Tunnel Node v3")
+    parser = argparse.ArgumentParser(description="LDN Tunnel Node v4")
     parser.add_argument("keys", help="prod.keys のパス")
     parser.add_argument("--role", required=True,
                         choices=["primary", "secondary"],
-                        help="primary: STA 参加+中継、secondary: AP プロキシ")
+                        help="primary: MAC スプーフ STA リレー、secondary: AP プロキシ")
     parser.add_argument("--local", required=True,
                         help="ローカル WireGuard IP")
     parser.add_argument("--remote", required=True,

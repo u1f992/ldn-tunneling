@@ -249,7 +249,8 @@ v3 では Switch A がホスト (部屋作成者) のまま、PC は透過的リ
 - [x] Pia 接続問題分析 → routing+NAT 設計
 - [x] routing+NAT 実装 → テスト → 失敗 (gretap1: 0 packets, broadcast 転送不可)
 - [x] bridge+tc mirred 改良版実装 (MAC learning 無効化)
-- [ ] 2拠点テスト: bridge+tc mirred 改良版で Pia 通信成立確認
+- [x] 2拠点テスト: L2 パス動作確認 ★Pia セッション確立失敗
+- [ ] v3 STA+AP の Pia 限界を克服する方法の検討
 
 #### v3 実装詳細 (tunnel_node.py)
 
@@ -467,6 +468,152 @@ routing+NAT コードを全廃止し、bridge+tc mirred に回帰 + MAC learning
    - `teardown_secondary()` → `teardown_tunnel()`
 
 7. **`cleanup_stale_interfaces` の iptables 清掃は維持** (routing+NAT 残骸対策)
+
+#### bridge+tc mirred 改良版テスト結果 (2026-02-23)
+
+**L2 データパスは完全に動作:**
+
+tcpdump 診断 (Primary 側、gretap1 / br-ldn / ldn の 3 インターフェース):
+- **gretap1**: Switch A の Pia broadcast (196 bytes) と Switch B の Pia broadcast (84 bytes) の両方が流れている
+- **br-ldn**: 同上 (bridge 経由で両方向通過)
+- **ldn**: Switch A の broadcast (RX) と Switch B の broadcast (TX, tc redirect 経由) の両方が確認
+
+データパス確認:
+- ✅ Switch A (.1) → ldn RX → tc mirred → bridge → gretap1 → tunnel → Secondary (196 bytes, ~100ms)
+- ✅ Switch B (.2) → Secondary TAP → gretap1 → tunnel → Primary bridge → tc mirred → ldn TX → Switch A (84 bytes)
+- ❌ ユニキャスト通信: `.1 → .2` も `.2 → .1` も **0 件**
+
+**問題は Pia プロトコル層:**
+
+両側の Pia broadcast discovery は互いに到達しているが、Pia セッション確立 (unicast) に移行しない。
+- Switch A の Pia: participant 1 (PC A) との Pia handshake を期待
+- PC A: ゲーム非実行 → Pia 状態なし → handshake に応答できない
+- Switch B の broadcast: PC A の IP (.2) から届くが、Pia ペイロード内の
+  セッション識別子が PC A の Pia 状態と不一致 → Switch A の Pia が無視
+- パケットサイズの違い (Switch A: 196 bytes, Switch B: 84 bytes) も
+  異なる Pia メッセージ型であることを示唆
+
+**結論:** v3 STA+AP アーキテクチャの根本的限界。
+PC A が Pia プロトコルに参加できないため、Switch A は PC A (participant 1) との
+Pia セッションを確立できず、Switch B の通信も Pia レベルで受理されない。
+L2 データパスは完璧に動作しているが、Pia の application-level handshake が成立しない。
+
+#### Pia プロトコル分析 (2026-02-23)
+
+**参照ソース:** https://github.com/kinnay/NintendoClients.wiki.git
+
+**Pia 通信の仕組み (LDN モード):**
+
+1. **発見**: LDN advertisement frame の application_data にセッション情報 (session_id, session_param)
+2. **セッション鍵**: session_param を SEAD RNG で展開 → AES(game_key) で暗号化 → 16 byte session key
+3. **Pia パケット (5.27-5.45)**: Magic `32 AB 98 64` + header (dst/src variable_id, packet_id, nonce, tag) + AES-GCM encrypted messages + footer
+4. **AES-GCM nonce (LDN)**: `CRC32(session_id + source_MAC)[0:3] + source_variable_id[0:1] + header_nonce[0:8]`
+5. **mesh 参加フロー**: 発見 → connection request (Station Protocol 0x14) → join request (Mesh Protocol 0x18) → join response → mesh update → 全ノード接続確立
+
+**根本原因の詳細分析 — 2 つの問題:**
+
+**問題 1: LDN-Pia tight coupling**
+- LDN ホスト (Switch A) が participant list を管理し、新規参加時に Pia 層に通知
+- Switch B は Secondary の AP に参加 → Switch A の LDN 層は Switch B を認知しない
+- → Switch A の Pia は mesh joining を開始しない
+- → Switch B の connection request は受理されない (unknown peer)
+
+**問題 2: MAC 書き換えによる nonce 不一致**
+- Pia の AES-GCM nonce に CRC32(session_id + **source_MAC**) が含まれる
+- managed-mode STA は送信時に source MAC を PC A の MAC に書き換える
+- Switch B の Pia: CRC32(session_id + **Switch_B_MAC**) で暗号化
+- Switch A の Pia: participant .2 = PC A → CRC32(session_id + **PC_A_MAC**) で復号試行 → 不一致 → 復号失敗
+- たとえ L2 パスが動作しても、暗号化レイヤーで必ず失敗する
+
+**問題 3: IP 衝突 (副次的)**
+- PC A と Switch B が同一 IP (.2) → Switch A の participant lookup が PC A の MAC を返す
+
+**Pia プロトコルのリレー関連機能:**
+- Station Protocol: message type 6/7 = Relay connection request/response
+- Message flags: 0x2 = "needs relay to single console", 0x4 = "needs relay to multiple", 0x8 = "was relayed"
+- Mesh Protocol: message type 0x81 = "Relay route directions"
+- → Pia にはリレー機構が組み込まれているが、NEX (オンライン) モード用と推測。LDN で使えるかは不明
+
+**MK8DX のゲーム鍵:** `ABCDEFGHIJKLMNOP` (Pia-Game-Keys.md)
+
+**検討中のアプローチ:**
+
+| アプローチ | 概要 | 利点 | 課題 |
+|---|---|---|---|
+| **A. Pia パケット翻訳** | UDP 層で Pia パケットを傍受、復号→nonce 変更→再暗号化 | L2 パスは既存を利用 | mesh 参加問題は未解決。variable_id 不明→peer 不明→パケット破棄。ゲーム鍵が必要 |
+| **B. LDN 認証注入** | monitor mode で 802.11 auth + LDN auth frame を注入。Switch B の MAC で Switch A の AP に直接参加 | MAC 問題を根本解決。Switch A が Switch B を participant として認識 | LDN 認証チャレンジ (HMAC-SHA256, device_id) の実装が必要。data frame 暗号化の取り扱い |
+| **C. 2 つ目の STA** | PC A に 2 つ目の managed IF (ldn2) を Switch B の MAC で追加、同じ AP に参加 | カーネルが暗号化を処理 | LDN 認証チャレンジ (ゲーム購入検証) のバイパスが必要。mac80211 multi-STA 対応 |
+| **D. LAN モード** | MK8DX の LAN モード (L+R+Left Stick) を使用。nonce に MAC でなく IP を使用 | 大幅に単純。bridge+tunnel だけで動く可能性 | ゲーム側の操作変更が必要。全ゲーム対応ではない |
+
+### アーキテクチャ (v4: MAC スプーフ STA リレー)
+
+v3 の根本的限界 (Pia がPC A を認識できない) を解決するため、
+**PC A が Switch B の MAC で Switch A の AP に参加する** 方式に変更。
+
+```
+[Switch A: LDN ホスト (部屋作成)]
+       ↕ Wi-Fi (LDN)
+[PC A: connect(address=Switch_B_MAC) = STA として参加]
+   station IF ←→ bridge ←→ gretap1
+                              ↕ WireGuard + TCP control
+   ldn-tap ←→ bridge ←→ gretap1
+[PC B: create_network() = AP プロキシ]
+       ↕ Wi-Fi (LDN)
+[Switch B: PC B の部屋に参加]
+```
+
+**核心アイデア:** PC A の STA インターフェースに Switch B の MAC を設定。
+- Switch A の LDN は Switch B が直接参加したと認識 → participant list に Switch B が登録される
+- managed-mode STA は送信時に source MAC = Switch B の MAC で送出
+- Pia AES-GCM nonce: CRC32(session_id + Switch_B_MAC) が一致 → 暗号化通信が透過的に成立
+- constant_id, service_variable_id も Switch B の MAC から導出 → 完全一致
+
+**フロー:**
+1. Primary: scan → NETWORK 情報取得 (**STA 接続はまだしない**)
+2. Primary: GRETAP tunnel + bridge 構築 → Secondary TCP 接続待機
+3. Secondary: NETWORK 受信 → AP 起動 → patch → READY 送信
+4. Switch B が Secondary の AP に参加 → JOIN (MAC) を Primary に送信
+5. Primary: **Switch B の MAC で STA 接続** → relay 構築
+6. Pia 通信が Switch A ↔ relay ↔ tunnel ↔ Switch B で透過的に成立
+
+**v3 との主な違い:**
+- scan 結果 (NetworkInfo) から NETWORK メッセージを生成 (STA 接続不要)
+- STA 接続を Switch B の JOIN 受信まで遅延 (MAC が必要なため)
+- ldn ライブラリに MAC スプーフ機能を追加 (ConnectNetworkParam.address)
+
+### v4 ldn ライブラリ変更 (MAC スプーフ)
+
+kinnay/LDN v0.0.16 に以下の最小変更を追加:
+
+**1. `wlan.py` — `Factory.connect_network()` に `address` パラメータ追加**
+- MAC アドレス変更は `update_link()` (route netlink RTM_NEWLINK) で IF が DOWN の間に実施
+- `Station.connect()` が `up()` → `_connect_network()` を呼ぶ前に MAC を設定
+
+**2. `__init__.py` — `ConnectNetworkParam` に `address` フィールド追加**
+- `address: MACAddress | None = None` をデータクラスに追加
+- `ldn.connect()` が `factory.connect_network()` に `param.address` を渡す
+
+### v4 tunnel_node.py 変更
+
+**新規・変更関数:**
+- `make_network_msg_from_scan(info)`: scan 結果の NetworkInfo を NETWORK メッセージに変換
+  - host IP (169.254.X.1) から network_id を抽出
+  - 8 participant エントリにパディング
+- `handle_primary_events(sta, peer_stream, relay_mac)`: relay_mac (= Switch B MAC) を追加
+  - 自身の JoinEvent (spoofed MAC) をフィルタして Secondary に転送しない
+- `handle_peer_messages_primary(reader)`: 簡略化。LEAVE で break (nursery cancel)
+
+**`run_primary()` フロー変更:**
+1. scan → NetworkInfo 取得 (STA 接続しない)
+2. setup_tunnel + bridge
+3. TCP listen → Secondary 接続待機
+4. `make_network_msg_from_scan(info)` で NETWORK 送信
+5. READY 待機
+6. **JOIN 待機** → Switch B の MAC 取得
+7. `ldn.connect(param)` with `param.address = ldn.MACAddress(switch_b_mac)`
+8. `setup_station_relay()` → event loop
+
+**`run_secondary()` は v3 と同一** (変更なし)。
 
 ---
 
