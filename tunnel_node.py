@@ -136,6 +136,9 @@ def add_tap_to_bridge():
     run(["bridge", "link", "set", "dev", "ldn-tap", "learning", "off"])
     run(["bridge", "link", "set", "dev", "gretap1", "learning", "off"])
     run(["sysctl", "-w", "net.ipv6.conf.ldn-tap.disable_ipv6=1"])
+    # 802.11 フレームは Ethernet より大きい (header 24 + CCMP 8 + SNAP 8 + MIC 8 = +34 bytes)
+    # MTU 1500 だと大きい Pia パケットの変換後フレームが EMSGSIZE になる
+    run(["ip", "link", "set", "ldn-mon", "mtu", "2304"])
 
 
 # --- Monkey-patching (Secondary only) ---
