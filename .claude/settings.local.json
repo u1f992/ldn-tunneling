@@ -25,7 +25,8 @@
       "Bash(tail:*)",
       "Bash(cd:*)",
       "WebFetch(domain:ldn.readthedocs.io)",
-      "Bash(.venv/bin/python:*)"
+      "Bash(.venv/bin/python:*)",
+      "Bash(ls:*)"
     ]
   }
 }
