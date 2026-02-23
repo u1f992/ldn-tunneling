@@ -309,6 +309,17 @@ def make_network_msg_from_scan(info):
     }
 
 
+def pick_secondary_channel(primary_channel):
+    """Secondary AP を Primary とは別のチャネルで運用する。
+
+    同一チャネルだと Switch A が spoofed STA と実 Switch B の MAC 衝突を検知し
+    disassociate する。2.4 GHz 非重複チャネル (1, 6, 11) から選択。
+    """
+    non_overlapping = [1, 6, 11]
+    candidates = [ch for ch in non_overlapping if ch != primary_channel]
+    return candidates[0]
+
+
 def make_create_param(keys, phy, msg):
     """NETWORK メッセージから CreateNetworkParam を構築する。"""
     param = ldn.CreateNetworkParam()
@@ -317,7 +328,7 @@ def make_create_param(keys, phy, msg):
     param.phyname_monitor = phy
     param.local_communication_id = msg["local_communication_id"]
     param.scene_id = msg["scene_id"]
-    param.channel = msg["channel"]
+    param.channel = pick_secondary_channel(msg["channel"])
     param.protocol = msg["protocol"]
     param.version = msg["version"]
     param.app_version = msg["app_version"]
