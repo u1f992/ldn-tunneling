@@ -72,6 +72,7 @@ def setup_tunnel(local_ip, remote_ip):
     run(["ip", "link", "add", "gretap1", "type", "gretap",
          "local", local_ip, "remote", remote_ip, "key", "1"])
     run(["ip", "link", "set", "gretap1", "up"])
+    run(["ip", "link", "set", "gretap1", "mtu", "1400"])
     run(["ip", "link", "add", "br-ldn", "type", "bridge",
          "stp_state", "0", "forward_delay", "0"])
     run(["ip", "link", "set", "br-ldn", "up"])
@@ -493,6 +494,9 @@ async def handle_peer_messages_secondary(network, reader):
         elif msg["type"] == "app_data":
             print(f"  [APP_DATA] updating ({len(msg['data']) // 2} bytes)")
             network.set_application_data(bytes.fromhex(msg["data"]))
+        elif msg["type"] == "accept":
+            print(f"  [ACCEPT] policy={msg['policy']}")
+            network.set_accept_policy(msg["policy"])
         elif msg["type"] == "connected":
             primary_idx = msg["index"]
             primary_ip = msg["ip"]

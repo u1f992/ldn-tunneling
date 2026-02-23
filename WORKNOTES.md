@@ -762,6 +762,40 @@ Switch B のパケットが ldn-tap に到着するが、gretap1 に転送され
    - `bridge link set dev ldn-tap learning off` + `bridge link set dev gretap1 learning off`
    - defense in depth: 仮に unicast が残っても unknown dst → flood
 
+### v4 テスト結果 (6回目): ロビー参加成功！コース選択未転送
+
+**テスト 5 の修正 (broadcast fix) の成果:**
+- Switch B → gretap1 (Secondary): 0 packets → **789 packets** ✓
+- Switch B → ldn (Primary): 0 → **553 packets** ✓
+- **プライマリ画面にセカンダリのアバターが表示された！** (Pia mesh 部分成功)
+
+**残存問題:**
+- セカンダリ画面では「通信エラー」が最初は発生 (不安定)
+- 何度か試行すると安定した持続通信が実現
+- **エモート送信が動作** → Pia 双方向通信は確立
+- **コース選択がセカンダリに転送されない** → ゲーム開始不可
+
+**分析:**
+- ALL 542 Pia packets from Switch B are broadcast (zero unicast Pia)
+- ARP 動作確認: Switch B の ARP request → Switch A の ARP reply が全インターフェースで確認
+- データパスは完全に双方向動作中
+
+**3つの追加修正:**
+
+1. **`_send_data_frame` source MAC 保持** (ldn library):
+   - 旧: Address3 (SA) = AP MAC → Switch B は全トラフィックが AP からに見える
+   - 新: Address3 (SA) = 元の Ethernet src → Switch A の MAC が正しく伝達
+   - `_transmit_data_frames` が Ethernet src を `_send_data_frame` に渡す
+   - これにより Switch B の ARP テーブル、ネットワークスタックが正しい MAC を認識
+
+2. **gretap1 MTU 1400 設定** (tunnel_node.py):
+   - WireGuard (MTU ~1420) + GRE overhead で大きいパケットがドロップされる可能性
+   - gretap1 MTU を 1400 に明示設定 → 大きい Pia パケット (コース選択データ) の損失を防止
+
+3. **accept_policy 転送** (tunnel_node.py):
+   - Secondary が Primary からの ACCEPT メッセージを処理していなかった
+   - `network.set_accept_policy(msg["policy"])` で AP のポリシーを同期
+
 ---
 
 ## ログ

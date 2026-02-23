@@ -5,5 +5,5 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "ldn @ git+https://github.com/u1f992/LDN.git@b24aef2581c827321ed5081391393284f4756bbb",
+    "ldn @ git+https://github.com/u1f992/LDN.git@7289995ba07b65ad05ee556b705bec43b3fcd06c",
 ]
