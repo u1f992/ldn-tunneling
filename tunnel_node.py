@@ -1,6 +1,6 @@
 """LDN Tunnel Node v4 — MAC スプーフ STA リレー
 Usage:
-  Primary:   sudo .venv/bin/python tunnel_node.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1
+  Primary:   sudo .venv/bin/python tunnel_node.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1 --switch-b-mac <MAC>
   Secondary: sudo .venv/bin/python tunnel_node.py prod.keys --role secondary --local <wg_ip> --remote <wg_ip> --phy phy1
   Solo test: sudo .venv/bin/python tunnel_node.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1 --solo
 
@@ -13,12 +13,12 @@ v4 MAC スプーフリレーアーキテクチャ:
                     participant 0 を Switch A の情報に書き換え、
                     Switch B から見て Switch A がホストに見える。
 
-  フロー:
-    1. Primary: scan → NETWORK 情報取得 (STA 接続はまだしない)
-    2. Primary: tunnel + bridge 構築 → Secondary 接続待機
-    3. Secondary: AP 作成 → Switch B 参加 → JOIN (MAC) を Primary に送信
-    4. Primary: Switch B の MAC で STA 接続 → relay 構築
-    5. Pia 通信が Switch A ↔ relay ↔ tunnel ↔ Switch B で透過的に成立
+  フロー (--switch-b-mac 事前指定により Switch B 参加前に relay 完成):
+    1. Primary: scan → NETWORK 情報取得
+    2. Primary: tunnel + bridge + STA 接続 (Switch B MAC) + relay 構築
+    3. Primary: Secondary 接続待機 → NETWORK + CONNECTED 送信
+    4. Secondary: AP 作成 → READY
+    5. Switch B が参加 → relay 経由で即座に Pia 通信開始
 """
 
 import argparse
@@ -570,106 +570,103 @@ async def run_primary(args):
                     break
         return
 
-    # 2. GRETAP tunnel + bridge (STA 接続前に構築)
+    # --- Non-solo mode: Switch B の MAC で先に STA 接続 + relay 構築 ---
+    # Switch B 参加前に relay を完成させることで Pia タイムアウトを回避する
+
+    switch_b_mac = args.switch_b_mac
+    if switch_b_mac is None:
+        print("Error: --switch-b-mac is required for non-solo mode")
+        print("Switch B の MAC は「設定 → インターネット」で確認できます")
+        return
+
+    # 2. GRETAP tunnel + bridge
     print("=== 2. GRETAP tunnel + bridge ===")
     setup_tunnel(args.local, args.remote)
     print()
 
     try:
-        # 3. Secondary 待機
-        listeners = await trio.open_tcp_listeners(
-            CONTROL_PORT, host=args.local)
-        try:
-            print(f"=== 3. Waiting for secondary on port {CONTROL_PORT} ===")
-            print(f"  Listening on {args.local}:{CONTROL_PORT}")
+        # 3. STA 接続 (Switch B 参加前に relay を完成させる)
+        print(f"=== 3. Connecting to Switch A as {switch_b_mac} ===")
+        param = ldn.ConnectNetworkParam()
+        param.keys = keys
+        param.phyname = args.phy
+        param.network = info
+        param.password = MK8DX_PASSWORD
+        param.name = b"LDN-Tunnel"
+        param.address = ldn.MACAddress(switch_b_mac)
 
-            peer_stream = await listeners[0].accept()
-            reader = LineReader(peer_stream)
-            print("  Secondary connected!")
-
-            # 4. NETWORK 送信 (scan 結果から)
-            net_msg = make_network_msg_from_scan(info)
-            await send_msg(peer_stream, net_msg)
-            print("  NETWORK sent, waiting for READY...")
-
-            try:
-                ready_msg = await recv_msg(reader)
-            except (trio.ClosedResourceError, trio.EndOfChannel):
-                print("  Secondary disconnected before READY")
-                return
-            assert ready_msg["type"] == "ready", \
-                f"Expected 'ready', got {ready_msg}"
-            print("  Secondary is ready!")
-            print()
-
-            # 5. Switch B の JOIN を待機
-            print("=== 4. Waiting for Switch B to join ===")
-            print("Switch B で「ローカル通信」から参加してください")
-            print()
-
-            join_msg = await recv_msg(reader)
-            assert join_msg["type"] == "join", \
-                f"Expected 'join', got {join_msg}"
-            switch_b_mac = join_msg["mac"]
-            switch_b_name = join_msg.get("name", "")
-            print(f"  Switch B joined! MAC={switch_b_mac}")
-            print()
-
-            # 6. Switch B の MAC で Switch A の AP に STA 接続
-            #    scan 結果は数分前の可能性があるため、connect 直前に再スキャンする
-            print("=== 5. Connecting to Switch A with Switch B's MAC ===")
-            param = ldn.ConnectNetworkParam()
-            param.keys = keys
-            param.phyname = args.phy
-            param.password = MK8DX_PASSWORD
-            param.name = bytes.fromhex(switch_b_name) if switch_b_name else b"LDN-Tunnel"
-            param.address = ldn.MACAddress(switch_b_mac)
-
-            max_connect_attempts = 3
-            for attempt in range(max_connect_attempts):
-                if attempt > 0:
-                    print(f"\n  Retry {attempt + 1}/{max_connect_attempts}"
-                          f" in 2 seconds...")
-                    await trio.sleep(2)
-
+        max_connect_attempts = 3
+        for attempt in range(max_connect_attempts):
+            if attempt > 0:
+                print(f"\n  Retry {attempt + 1}/{max_connect_attempts}"
+                      f" in 2 seconds...")
+                await trio.sleep(2)
                 # Re-scan for fresh NetworkInfo
-                print("  Re-scanning for fresh NetworkInfo...")
+                print("  Re-scanning...")
                 fresh_info = await scan_mk8dx(keys, args.phy)
                 if fresh_info is None:
                     print("  Network not found!")
                     continue
                 param.network = fresh_info
 
-                try:
-                    async with ldn.connect(param) as sta:
-                        sta_index = sta._participant_id
-                        sta_ip = sta.participant().ip_address
-                        print(f"  Connected as STA"
-                              f" (participant {sta_index})")
-                        print(f"  IP: {sta_ip}")
-                        print(f"  MAC: {switch_b_mac} (spoofed)")
-                        print()
+            try:
+                async with ldn.connect(param) as sta:
+                    sta_index = sta._participant_id
+                    sta_ip = sta.participant().ip_address
+                    print(f"  Connected (participant {sta_index})")
+                    print(f"  IP: {sta_ip}")
+                    print(f"  MAC: {switch_b_mac} (spoofed)")
+                    print()
 
-                        # 6a. CONNECTED 通知 → Secondary に IP/index を同期
+                    # 4. Relay 構築 (Switch B 参加前に完成)
+                    print("=== 4. Setting up relay ===")
+                    setup_station_relay()
+                    print()
+
+                    # 5. Secondary 待機
+                    listeners = await trio.open_tcp_listeners(
+                        CONTROL_PORT, host=args.local)
+                    try:
+                        print(f"=== 5. Waiting for secondary"
+                              f" on port {CONTROL_PORT} ===")
+                        print(f"  Listening on"
+                              f" {args.local}:{CONTROL_PORT}")
+
+                        peer_stream = await listeners[0].accept()
+                        reader = LineReader(peer_stream)
+                        print("  Secondary connected!")
+
+                        # 6. NETWORK + CONNECTED 送信
+                        net_msg = make_network_msg_from_scan(info)
+                        await send_msg(peer_stream, net_msg)
                         await send_msg(peer_stream, {
                             "type": "connected",
                             "index": sta_index,
                             "ip": sta_ip,
                         })
-                        print(f"  CONNECTED sent"
-                              f" (idx={sta_index}, ip={sta_ip})")
+                        print("  NETWORK + CONNECTED sent,"
+                              " waiting for READY...")
 
-                        # 7. Relay 構築
-                        print("=== 6. Setting up relay ===")
-                        setup_station_relay()
+                        try:
+                            ready_msg = await recv_msg(reader)
+                        except (trio.ClosedResourceError,
+                                trio.EndOfChannel):
+                            print("  Secondary disconnected"
+                                  " before READY")
+                            return
+                        assert ready_msg["type"] == "ready", \
+                            f"Expected 'ready', got {ready_msg}"
+                        print("  Secondary is ready!")
                         print()
 
                         print("=== Ready ===")
+                        print("Switch B で「ローカル通信」"
+                              "から参加してください")
                         print("Pia 通信が透過的にリレーされます")
                         print("Ctrl+C で終了")
                         print()
 
-                        # 8. Event loop
+                        # 7. Event loop
                         async with trio.open_nursery() as nursery:
                             nursery.start_soon(
                                 handle_primary_events,
@@ -684,18 +681,18 @@ async def run_primary(args):
 
                             nursery.start_soon(_wait_secondary)
 
-                        # Event loop 正常終了 → retry 不要
-                        break
-                except ConnectionError as e:
-                    print(f"  Connect failed: {e}")
-                    if attempt < max_connect_attempts - 1:
-                        print("  Will retry with fresh scan...")
-                        continue
-                    raise
+                    finally:
+                        for listener in listeners:
+                            await listener.aclose()
 
-        finally:
-            for listener in listeners:
-                await listener.aclose()
+                    # Event loop 正常終了 → retry 不要
+                    break
+            except ConnectionError as e:
+                print(f"  Connect failed: {e}")
+                if attempt < max_connect_attempts - 1:
+                    print("  Will retry...")
+                    continue
+                raise
 
     finally:
         teardown_tunnel()
@@ -774,6 +771,8 @@ async def main():
                         help="リモート WireGuard IP")
     parser.add_argument("--phy", required=True,
                         help="Wi-Fi phy 名 (例: phy1)")
+    parser.add_argument("--switch-b-mac", default=None,
+                        help="Switch B の MAC アドレス (例: 64:B5:C6:1B:14:9B)")
     parser.add_argument("--solo", action="store_true",
                         help="単拠点テスト: STA 参加のみ (トンネルなし)")
     args = parser.parse_args()

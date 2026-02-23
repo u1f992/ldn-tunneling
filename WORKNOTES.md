@@ -678,9 +678,38 @@ MAC スプーフ接続が不安定な原因として最も可能性が高いの�
 - solo mode は scan 直後に connect するため成功する
 - v4 は tunnel 構築 + Secondary 待機 + Switch B JOIN 待機の間に分単位の遅延が発生
 
-**修正: connect 直前に再スキャン + リトライ**
+**修正 1: connect 直前に再スキャン + リトライ**
 - `run_primary()` で connect 前に `scan_mk8dx()` を再実行して最新の NetworkInfo を取得
 - ConnectionError 発生時は最大 3 回リトライ (2 秒間隔、毎回再スキャン)
+
+### v4 テスト結果 (4回目): STA 接続成功、Pia タイムアウト
+
+再スキャン修正で **MAC スプーフ STA 接続に成功** (テスト 2,3 の失敗を解消)。
+しかしゲーム側は「通信エラーが発生しました」で変わらず。
+
+**タイミング問題が根本原因:**
+```
+Switch B 参加 → Pia 開始 → [relay 未構築] → Pia タイムアウト → 通信エラー → LEAVE
+                              ↑ この間に Primary が re-scan + connect + relay
+```
+
+- Switch B が Secondary AP に参加した時点で Pia 通信を即座に開始する
+- しかし Primary の relay (tc mirred) は Switch B の JOIN 受信後に構築するため、
+  数秒間トラフィックが通らない → Pia タイムアウト
+
+**v4 の設計問題**: relay に Switch B の MAC が必要 → JOIN を待つ必要があるが、
+Switch B は JOIN 直後から Pia を要求する (chicken-and-egg 問題)
+
+**修正 2: `--switch-b-mac` 事前指定で relay を先に完成**
+
+Switch B の MAC をコマンドライン引数で事前指定し、フローを再構成:
+
+旧フロー: `scan → tunnel → TCP listen → NETWORK → READY → JOIN → connect → relay`
+新フロー: `scan → tunnel → connect → relay → TCP listen → NETWORK+CONNECTED → READY`
+
+- STA 接続 + relay 構築を Secondary 接続前に実施
+- Switch B 参加時には relay が完全に動作中 → Pia が即座に通信可能
+- `--switch-b-mac` は Switch の「設定 → インターネット」で確認可能
 
 ---
 
