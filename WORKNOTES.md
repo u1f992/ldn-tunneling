@@ -835,6 +835,58 @@ run(["ip", "link", "set", "gretap1", "mtu", "1500"])
   - 1470 byte 内部フレーム → 1498 byte 外側 IP → WireGuard で断片化 → リモートで再組み立て
   - 断片化のオーバーヘッドはあるが、パケットドロップより遥かに良い
 
+### テスト 8: gretap MTU 修正確認 → EMSGSIZE クラッシュ
+
+**結果:** ロビー参加の「しばらくお待ちください」は即終了 → MTU 修正成功
+しかしコース選択送信時に Secondary がクラッシュ:
+```
+OSError: [Errno 90] Message too long
+  at ldn/__init__.py:1868 _send_data_frame → _monitor.send_frame()
+```
+
+**tcpdump で MTU 修正の効果を確認:**
+
+| 観測箇所 | テスト 7 (MTU 1400) | テスト 8 (nopmtudisc + MTU 1500) |
+|---|---|---|
+| a-tcpdump-ldn | 3323 | 513 |
+| a-tcpdump-gretap1 | **0** (全ドロップ) | **513** ✓ |
+| b-tcpdump-gretap1 | **0** | **513** ✓ |
+| b-tcpdump-ldn-tap | 23 (Switch B のみ) | **503** ✓ |
+
+大きいパケットが全インターフェースを貫通。gretap MTU 問題は完全に解決。
+
+**根本原因: monitor インターフェース MTU**
+- 大きい Ethernet フレーム (1470 bytes) が TAP に到着
+- LDN ライブラリが 802.11 フレームに変換: +34 bytes (header 24 + CCMP 8 + SNAP 8 + MIC 8 - Ethernet header 14 + SNAP type 8)
+- 変換後フレーム ≈ 1504+ bytes > ldn-mon MTU 1500 → EMSGSIZE
+
+**修正:**
+```python
+# add_tap_to_bridge() に追加
+run(["ip", "link", "set", "ldn-mon", "mtu", "2304"])
+```
+2304 = 802.11 最大フレーム本体サイズ。
+
+### テスト 9: MK8DX 1レース完走 ★成功
+
+**結果: LDN over WAN で MK8DX 1レースを安定して完走。**
+
+- ロビー参加: 即座に成功
+- コース選択: Primary → Secondary に正常転送
+- レース: 安定して 1 レース完走
+- **v4 アーキテクチャ (MAC スプーフ STA リレー) の動作実証完了**
+
+**最終的な修正の積み重ね (テスト 5 → 9):**
+
+1. **テスト 5 → 6**: `_process_data_frame` broadcast 強制 + MAC learning 無効化
+   - Switch B → gretap1 のブリッジ転送を修正 (0 → 789 パケット)
+2. **テスト 6 → 7**: `_send_data_frame` source MAC 保持 + accept_policy 転送
+   - 802.11 Address3 に元の送信者 MAC を設定、AP ポリシー同期
+3. **テスト 7 → 8**: gretap `nopmtudisc` + MTU 1500
+   - 大きい Pia パケット (3323 個) のドロップを解消
+4. **テスト 8 → 9**: ldn-mon MTU 2304
+   - 802.11 変換後フレームの EMSGSIZE を解消
+
 ---
 
 ## ログ
