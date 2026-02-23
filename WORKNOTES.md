@@ -711,6 +711,57 @@ Switch B の MAC をコマンドライン引数で事前指定し、フローを
 - Switch B 参加時には relay が完全に動作中 → Pia が即座に通信可能
 - `--switch-b-mac` は Switch の「設定 → インターネット」で確認可能
 
+### v4 テスト結果 (5回目): Pia 応答なし — Switch B → tunnel 方向の bridge 転送失敗
+
+**症状:** 「通信相手からの応答がありませんでした」(Pia タイムアウト)
+- STA 接続成功 (--switch-b-mac 事前接続で relay 構築済み)
+- Switch B 参加 → 2回 JOIN → 2回 LEAVE (Pia タイムアウト)
+
+**tcpdump 分析:**
+
+| インターフェース | Switch A (5c:52:1e:ea:eb:9e) | Switch B (64:b5:c6:1b:14:9b) |
+|---|---|---|
+| a-tcpdump-ldn | 694 UDP (Pia broadcast) | — |
+| a-tcpdump-gretap1 | 672 UDP | — |
+| b-tcpdump-ldn-tap | 605 UDP (from tunnel) | 127 packets (all unicast!) |
+| b-tcpdump-gretap1 | 468 UDP (Switch A only) | **0 packets** |
+
+**根本原因: Switch B → gretap1 方向が完全に破損**
+
+Switch B のパケットが ldn-tap に到着するが、gretap1 に転送されない。
+
+**Ethernet dst の問題:**
+- Switch A のパケット (tunnel 経由): `5c:52:1e:ea:eb:9e > ff:ff:ff:ff:ff:ff` (broadcast) → bridge がフラッディング → OK
+- Switch B のパケット (_process_data_frame 経由): `64:b5:c6:1b:14:9b > b0:7f:b9:fb:66:96` (unicast) → bridge が local delivery → gretap1 に転送しない
+
+**`b0:7f:b9:fb:66:96` の正体:**
+- ldn-tap インターフェースの MAC アドレス (= AP monitor MAC = Secondary の WiFi アダプタ MAC)
+- 確認: mDNS パケット `b0:7f:b9:fb:66:96 > 01:00:5e:00:00:fb` from `169.254.55.254` (TAP IP)
+- **ALL 127 packets from Switch B have dst = b0:7f:b9:fb:66:96** (unicast to AP MAC)
+- **Zero** broadcast packets from Switch B (even ARP requests are unicast to AP MAC)
+
+**なぜ Address3 = AP MAC なのか:**
+- LDN では AP = ホスト。AP の BSSID = ホストの participant MAC
+- Secondary AP の BSSID = `b0:7f:b9:fb:66:96` = participant 0 の MAC (patched)
+- Switch B は participant 0 (Switch A ホスト) に unicast で Pia 送信
+- 802.11 ToDS: Address3 = DA = participant 0 MAC = AP BSSID = `b0:7f:b9:fb:66:96`
+- `_process_data_frame`: `header.target = frame.bssid` (Address3) → Ethernet dst = AP MAC
+
+**なぜ bridge が転送しないのか:**
+- `b0:7f:b9:fb:66:96` は ldn-tap ポートの own MAC → bridge の local FDB entry
+- bridge は local 宛てフレームを host stack に配信、他ポートに転送しない
+- MAC learning on/off は関係なく、port own MAC は常に local 扱い
+
+**修正:**
+
+1. **`_process_data_frame` (ldn/__init__.py:1852)**: `header.target = MACAddress("ff:ff:ff:ff:ff:ff")`
+   - Ethernet dst を常に broadcast にする → bridge が全ポートにフラッディング → gretap1 に到達
+   - `_transmit_data_frames` は Ethernet dst を無視して常に WiFi broadcast するため安全
+
+2. **`add_tap_to_bridge()` (tunnel_node.py:131)**: MAC learning 無効化追加
+   - `bridge link set dev ldn-tap learning off` + `bridge link set dev gretap1 learning off`
+   - defense in depth: 仮に unicast が残っても unknown dst → flood
+
 ---
 
 ## ログ

@@ -129,8 +129,10 @@ def teardown_tunnel():
 
 
 def add_tap_to_bridge():
-    """Secondary: TAP を br-ldn に追加する。"""
+    """Secondary: TAP を br-ldn に追加する。MAC learning 無効化でフラッディング強制。"""
     run(["ip", "link", "set", "ldn-tap", "master", "br-ldn"])
+    run(["bridge", "link", "set", "dev", "ldn-tap", "learning", "off"])
+    run(["bridge", "link", "set", "dev", "gretap1", "learning", "off"])
     run(["sysctl", "-w", "net.ipv6.conf.ldn-tap.disable_ipv6=1"])
 
 
