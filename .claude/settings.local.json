@@ -27,7 +27,9 @@
       "WebFetch(domain:ldn.readthedocs.io)",
       "Bash(.venv/bin/python:*)",
       "Bash(ls:*)",
-      "mcp__ide__getDiagnostics"
+      "mcp__ide__getDiagnostics",
+      "Bash(git fetch:*)",
+      "Bash(git show:*)"
     ]
   }
 }

@@ -1,14 +1,20 @@
 """LDN Tunnel Node v4 — MAC スプーフ STA リレー
+
+Prerequisites:
+  sudo setcap cap_net_admin,cap_net_raw+ep .venv/bin/python
+  # CAP_NET_ADMIN: netlink (nl80211, rtnetlink, tc), /dev/net/tun ioctl, /proc/sys/net 書き込み
+  # CAP_NET_RAW:   AF_PACKET SOCK_RAW ソケット (モニタモードフレーム送受信)
+
 Usage:
-  Primary:   sudo .venv/bin/python main.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1 --switch-b-mac <MAC> --ldn-passphrase <FILE>
-  Secondary: sudo .venv/bin/python main.py prod.keys --role secondary --local <wg_ip> --remote <wg_ip> --phy phy1 --ldn-passphrase <FILE>
+  Primary:   .venv/bin/python main.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1 --switch-b-mac <MAC> --ldn-passphrase <FILE>
+  Secondary: .venv/bin/python main.py prod.keys --role secondary --local <wg_ip> --remote <wg_ip> --phy phy1 --ldn-passphrase <FILE>
 
 一部のゲームの LDN パスフレーズは以下で公開されている:
   https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases
 
 MK8DX の場合:
   printf 'MarioKart8Delux\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' > mk8dx.pass
-  sudo .venv/bin/python main.py prod.keys --role primary --local 10.0.0.1 --remote 10.0.0.2 --phy phy1 --switch-b-mac 64:B5:C6:1B:14:9B --ldn-passphrase mk8dx.pass
+  .venv/bin/python main.py prod.keys --role primary --local 10.0.0.1 --remote 10.0.0.2 --phy phy1 --switch-b-mac 64:B5:C6:1B:14:9B --ldn-passphrase mk8dx.pass
 
 v4 MAC スプーフリレーアーキテクチャ:
   Primary (PC A):   Switch B の MAC で Switch A の AP に STA 接続。
@@ -231,7 +237,7 @@ def _decode_msg(d: dict[str, Any]) -> ControlMsg:
 
 
 def _disable_ipv6(ifname: str):
-    """procfs 直書き (sysctl subprocess の代替)"""
+    """procfs 直書きで IPv6 を無効化する (CAP_NET_ADMIN で書き込み可能)。"""
     with open(f"/proc/sys/net/ipv6/conf/{ifname}/disable_ipv6", "w") as f:
         f.write("1")
 
