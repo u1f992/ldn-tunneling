@@ -2,7 +2,6 @@
 Usage:
   Primary:   sudo .venv/bin/python main.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1 --switch-b-mac <MAC> --ldn-passphrase <FILE>
   Secondary: sudo .venv/bin/python main.py prod.keys --role secondary --local <wg_ip> --remote <wg_ip> --phy phy1 --ldn-passphrase <FILE>
-  Solo test: sudo .venv/bin/python main.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1 --solo --ldn-passphrase <FILE>
 
 一部のゲームの LDN パスフレーズは以下で公開されている:
   https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases
@@ -32,6 +31,7 @@ import argparse
 import json
 import types
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Generator
 
 import trio
@@ -52,6 +52,48 @@ IF_RELAY_STA = "relay-sta"
 IF_RELAY_BR = "relay-br"
 IF_BRIDGE = "br-ldn"
 IF_GRETAP = "gretap1"
+
+
+# --- Config ---
+
+
+@dataclass(frozen=True)
+class _BaseConfig:
+    keys: str
+    phy: str
+    ldn_passphrase: bytes | None
+    local: str
+    remote: str
+    control_port: int
+
+    def __post_init__(self):
+        for field, expected in {
+            "keys": str,
+            "phy": str,
+            "ldn_passphrase": (bytes, type(None)),
+            "local": str,
+            "remote": str,
+            "control_port": int,
+        }.items():
+            if not isinstance(getattr(self, field), expected):
+                raise TypeError(
+                    f"--{field.replace('_', '-')} must be {expected.__name__}"
+                )
+
+
+@dataclass(frozen=True)
+class PrimaryConfig(_BaseConfig):
+    switch_b_mac: str
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not isinstance(self.switch_b_mac, str):
+            raise TypeError("--switch-b-mac is required for primary role")
+
+
+@dataclass(frozen=True)
+class SecondaryConfig(_BaseConfig):
+    pass
 
 
 # --- pyroute2 helpers ---
@@ -654,14 +696,14 @@ async def handle_peer_messages_secondary(network, reader):
 # --- Main flows ---
 
 
-async def run_primary(ipr: IPRoute, args):
-    keys = ldn.load_keys(args.keys)
+async def run_primary(ipr: IPRoute, config: PrimaryConfig):
+    keys = ldn.load_keys(config.keys)
 
     # 1. Scan (STA 接続はしない — scan 結果から全情報を取得)
     print("=== 1. Scan for LDN network ===")
     print("Switch A でローカル通信の部屋を作ってください")
     print()
-    info = await scan_ldn(keys, args.phy)
+    info = await scan_ldn(keys, config.phy)
     if info is None:
         print("LDN network not found.")
         return
@@ -678,67 +720,20 @@ async def run_primary(ipr: IPRoute, args):
     print(f"  network_id={network_id}")
     print()
 
-    if args.solo:
-        # Solo mode: 従来通り PC A の MAC で接続して監視
-        print("=== 2. Solo: Connecting as STA ===")
-        param = ldn.ConnectNetworkParam()
-        param.keys = keys
-        param.phyname = args.phy
-        param.network = info
-        param.password = args.ldn_passphrase
-        param.name = b"LDN-Tunnel"
-
-        async with ldn.connect(param) as sta:
-            print(f"  Connected (participant {sta._participant_id})")
-            print(f"  IP: {sta.participant().ip_address}")
-            print("Ctrl+C で終了")
-            print()
-            while True:
-                event = await sta.next_event()
-                if isinstance(event, ldn.JoinEvent):
-                    p = event.participant
-                    print(
-                        f"  [JOIN] idx={event.index}"
-                        f" {p.name.decode(errors='replace')}"
-                        f" IP={p.ip_address} MAC={p.mac_address}"
-                    )
-                elif isinstance(event, ldn.LeaveEvent):
-                    p = event.participant
-                    print(
-                        f"  [LEAVE] idx={event.index} {p.name.decode(errors='replace')}"
-                    )
-                elif isinstance(event, ldn.ApplicationDataChanged):
-                    print(f"  [APP_DATA] {len(event.new)} bytes")
-                elif isinstance(event, ldn.AcceptPolicyChanged):
-                    print(f"  [ACCEPT] {event.old} -> {event.new}")
-                elif isinstance(event, ldn.DisconnectEvent):
-                    print(f"  [DISCONNECT] reason={event.reason}")
-                    break
-        return
-
-    # --- Non-solo mode: Switch B の MAC で先に STA 接続 + relay 構築 ---
-    # Switch B 参加前に relay を完成させることで Pia タイムアウトを回避する
-
-    switch_b_mac = args.switch_b_mac
-    if switch_b_mac is None:
-        print("Error: --switch-b-mac is required for non-solo mode")
-        print("Switch B の MAC は「設定 → インターネット」で確認できます")
-        return
-
     # 2. GRETAP tunnel + bridge
     print("=== 2. GRETAP tunnel + bridge ===")
-    with setup_tunnel(ipr, args.local, args.remote) as (idx_gretap, idx_br):
+    with setup_tunnel(ipr, config.local, config.remote) as (idx_gretap, idx_br):
         print()
 
         # 3. STA 接続 (Switch B 参加前に relay を完成させる)
-        print(f"=== 3. Connecting to Switch A as {switch_b_mac} ===")
+        print(f"=== 3. Connecting to Switch A as {config.switch_b_mac} ===")
         param = ldn.ConnectNetworkParam()
         param.keys = keys
-        param.phyname = args.phy
+        param.phyname = config.phy
         param.network = info
-        param.password = args.ldn_passphrase
+        param.password = config.ldn_passphrase or b""
         param.name = b"LDN-Tunnel"
-        param.address = ldn.MACAddress(switch_b_mac)
+        param.address = ldn.MACAddress(config.switch_b_mac)
 
         max_connect_attempts = 3
         for attempt in range(max_connect_attempts):
@@ -747,7 +742,7 @@ async def run_primary(ipr: IPRoute, args):
                 await trio.sleep(2)
                 # Re-scan for fresh NetworkInfo
                 print("  Re-scanning...")
-                fresh_info = await scan_ldn(keys, args.phy)
+                fresh_info = await scan_ldn(keys, config.phy)
                 if fresh_info is None:
                     print("  Network not found!")
                     continue
@@ -759,7 +754,7 @@ async def run_primary(ipr: IPRoute, args):
                     sta_ip = sta.participant().ip_address
                     print(f"  Connected (participant {sta_index})")
                     print(f"  IP: {sta_ip}")
-                    print(f"  MAC: {switch_b_mac} (spoofed)")
+                    print(f"  MAC: {config.switch_b_mac} (spoofed)")
                     print()
 
                     # 4. Relay 構築 (Switch B 参加前に完成)
@@ -769,13 +764,15 @@ async def run_primary(ipr: IPRoute, args):
 
                         # 5. Secondary 待機
                         listeners = await trio.open_tcp_listeners(
-                            args.control_port, host=args.local
+                            config.control_port, host=config.local
                         )
                         try:
                             print(
-                                f"=== 5. Waiting for secondary on port {args.control_port} ==="
+                                f"=== 5. Waiting for secondary on port {config.control_port} ==="
                             )
-                            print(f"  Listening on {args.local}:{args.control_port}")
+                            print(
+                                f"  Listening on {config.local}:{config.control_port}"
+                            )
 
                             peer_stream = await listeners[0].accept()
                             reader = LineReader(peer_stream)
@@ -817,7 +814,7 @@ async def run_primary(ipr: IPRoute, args):
                                     handle_primary_events,
                                     sta,
                                     peer_stream,
-                                    switch_b_mac,
+                                    config.switch_b_mac,
                                 )
 
                                 async def _wait_secondary(
@@ -842,17 +839,19 @@ async def run_primary(ipr: IPRoute, args):
                 raise
 
 
-async def run_secondary(ipr: IPRoute, args):
-    keys = ldn.load_keys(args.keys)
+async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
+    keys = ldn.load_keys(config.keys)
 
     # 1. GRETAP + bridge
     print("=== 1. GRETAP tunnel + bridge ===")
-    with setup_tunnel(ipr, args.local, args.remote) as (idx_gretap, idx_br):
+    with setup_tunnel(ipr, config.local, config.remote) as (idx_gretap, idx_br):
         print()
 
         # 2. Connect to primary
-        print(f"=== 2. Connecting to primary at {args.remote}:{args.control_port} ===")
-        peer_stream = await trio.open_tcp_stream(args.remote, args.control_port)
+        print(
+            f"=== 2. Connecting to primary at {config.remote}:{config.control_port} ==="
+        )
+        peer_stream = await trio.open_tcp_stream(config.remote, config.control_port)
         reader = LineReader(peer_stream)
         print("  Connected!")
 
@@ -871,7 +870,9 @@ async def run_secondary(ipr: IPRoute, args):
 
         # 4. Host proxy LDN
         print("=== 3. Hosting proxy LDN network ===")
-        param = make_create_param(keys, args.phy, net_msg, args.ldn_passphrase)
+        param = make_create_param(
+            keys, config.phy, net_msg, config.ldn_passphrase or b""
+        )
 
         async with ldn.create_network(param) as network:
             # 5. Patch: Switch A のプロキシとして構成
@@ -916,12 +917,9 @@ async def main():
         help="Switch B の MAC アドレス (例: 64:B5:C6:1B:14:9B)",
     )
     parser.add_argument(
-        "--solo", action="store_true", help="単拠点テスト: STA 参加のみ (トンネルなし)"
-    )
-    parser.add_argument(
         "--ldn-passphrase",
-        required=True,
-        help="LDN パスフレーズを格納したバイナリファイルのパス. "
+        default=None,
+        help="LDN パスフレーズを格納したバイナリファイルのパス (省略時は空). "
         "参照: https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases",
     )
     parser.add_argument(
@@ -931,15 +929,29 @@ async def main():
         help=f"Primary-Secondary 間の制御ポート (default: {DEFAULT_CONTROL_PORT})",
     )
     args = parser.parse_args()
-    with open(args.ldn_passphrase, "rb") as f:
-        args.ldn_passphrase = f.read()
+    if args.ldn_passphrase is not None:
+        with open(args.ldn_passphrase, "rb") as f:
+            passphrase = f.read()
+    else:
+        passphrase = None
+
+    common = dict(
+        keys=args.keys,
+        phy=args.phy,
+        ldn_passphrase=passphrase,
+        local=args.local,
+        remote=args.remote,
+        control_port=args.control_port,
+    )
 
     with IPRoute() as ipr:
         cleanup_stale_interfaces(ipr)
         if args.role == "primary":
-            await run_primary(ipr, args)
+            config = PrimaryConfig(**common, switch_b_mac=args.switch_b_mac)
+            await run_primary(ipr, config)
         else:
-            await run_secondary(ipr, args)
+            config = SecondaryConfig(**common)
+            await run_secondary(ipr, config)
 
 
 if __name__ == "__main__":
