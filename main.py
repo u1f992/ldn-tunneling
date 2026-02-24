@@ -1,8 +1,15 @@
 """LDN Tunnel Node v4 — MAC スプーフ STA リレー
 Usage:
-  Primary:   sudo .venv/bin/python main.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1 --switch-b-mac <MAC>
-  Secondary: sudo .venv/bin/python main.py prod.keys --role secondary --local <wg_ip> --remote <wg_ip> --phy phy1
-  Solo test: sudo .venv/bin/python main.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1 --solo
+  Primary:   sudo .venv/bin/python main.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1 --switch-b-mac <MAC> --ldn-passphrase <FILE>
+  Secondary: sudo .venv/bin/python main.py prod.keys --role secondary --local <wg_ip> --remote <wg_ip> --phy phy1 --ldn-passphrase <FILE>
+  Solo test: sudo .venv/bin/python main.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1 --solo --ldn-passphrase <FILE>
+
+一部のゲームの LDN パスフレーズは以下で公開されている:
+  https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases
+
+MK8DX の場合:
+  printf 'MarioKart8Delux\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' > mk8dx.pass
+  sudo .venv/bin/python main.py prod.keys --role primary --local 10.0.0.1 --remote 10.0.0.2 --phy phy1 --switch-b-mac 64:B5:C6:1B:14:9B --ldn-passphrase mk8dx.pass
 
 v4 MAC スプーフリレーアーキテクチャ:
   Primary (PC A):   Switch B の MAC で Switch A の AP に STA 接続。
@@ -33,10 +40,6 @@ from pyroute2.netlink.rtnl import TC_H_ROOT
 
 
 # --- Constants ---
-
-MK8DX_PASSWORD = (
-    b"MarioKart8Delux" + b"\x00" * 17
-)  # https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases
 
 CONTROL_PORT = 39571
 
@@ -481,7 +484,7 @@ def pick_secondary_channel(primary_channel):
     return candidates[0]
 
 
-def make_create_param(keys, phy, msg):
+def make_create_param(keys, phy, msg, passphrase):
     """NETWORK メッセージから CreateNetworkParam を構築する。"""
     param = ldn.CreateNetworkParam()
     param.keys = keys
@@ -499,7 +502,7 @@ def make_create_param(keys, phy, msg):
     param.application_data = bytes.fromhex(msg["application_data"])
     param.server_random = bytes.fromhex(msg["server_random"])
     param.ssid = bytes.fromhex(msg["ssid"])
-    param.password = MK8DX_PASSWORD
+    param.password = passphrase
     param.name = b"LDN-Tunnel"
     return param
 
@@ -700,12 +703,12 @@ async def run_primary(ipr: IPRoute, args):
     cleanup_stale_interfaces(ipr)
 
     # 1. Scan (STA 接続はしない — scan 結果から全情報を取得)
-    print("=== 1. Scan for MK8DX ===")
+    print("=== 1. Scan for LDN network ===")
     print("Switch A でローカル通信の部屋を作ってください")
     print()
     info = await scan_ldn(keys, args.phy)
     if info is None:
-        print("MK8DX network not found.")
+        print("LDN network not found.")
         return
 
     host = info.participants[0]
@@ -727,7 +730,7 @@ async def run_primary(ipr: IPRoute, args):
         param.keys = keys
         param.phyname = args.phy
         param.network = info
-        param.password = MK8DX_PASSWORD
+        param.password = args.ldn_passphrase
         param.name = b"LDN-Tunnel"
 
         async with ldn.connect(param) as sta:
@@ -779,7 +782,7 @@ async def run_primary(ipr: IPRoute, args):
         param.keys = keys
         param.phyname = args.phy
         param.network = info
-        param.password = MK8DX_PASSWORD
+        param.password = args.ldn_passphrase
         param.name = b"LDN-Tunnel"
         param.address = ldn.MACAddress(switch_b_mac)
 
@@ -916,7 +919,7 @@ async def run_secondary(ipr: IPRoute, args):
 
         # 4. Host proxy LDN
         print("=== 3. Hosting proxy LDN network ===")
-        param = make_create_param(keys, args.phy, net_msg)
+        param = make_create_param(keys, args.phy, net_msg, args.ldn_passphrase)
 
         async with ldn.create_network(param) as network:
             # 5. Patch: Switch A のプロキシとして構成
@@ -964,7 +967,15 @@ async def main():
     parser.add_argument(
         "--solo", action="store_true", help="単拠点テスト: STA 参加のみ (トンネルなし)"
     )
+    parser.add_argument(
+        "--ldn-passphrase",
+        required=True,
+        help="LDN パスフレーズを格納したバイナリファイルのパス. "
+        "参照: https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases",
+    )
     args = parser.parse_args()
+    with open(args.ldn_passphrase, "rb") as f:
+        args.ldn_passphrase = f.read()
 
     with IPRoute() as ipr:
         if args.role == "primary":
