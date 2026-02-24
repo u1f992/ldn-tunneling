@@ -1,7 +1,7 @@
 [project]
 name = "ldn-tunneling"
 version = "0.1.0"
-description = "Add your description here"
+description = "Bridge Nintendo Switch LDN sessions across the internet using MAC-spoofed STA relay (proof of concept)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

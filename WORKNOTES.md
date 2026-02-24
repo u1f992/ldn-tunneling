@@ -1294,6 +1294,51 @@ sudo systemctl reload NetworkManager
 - upstream ldn 0.0.16 未パッチ状態で `--solo` テスト → スキャン・ホスト・Switch 参加すべて正常動作
 - **結論: ライブラリへのパッチは一切不要。NM 管理外設定のみで十分**
 
+### 2026-02-24: ファイアウォール (ufw) と GRETAP の調査
+
+GRETAPトンネル接続中に、ufw で GRE (IP protocol 47) を明示的に許可していないのに
+GRETAP が動作する理由を調査。
+
+**ufw の状態:**
+```
+$ sudo ufw status verbose
+Default: deny (incoming), allow (outgoing), deny (routed)
+39571/tcp                  ALLOW IN    10.8.0.0/24
+```
+- GRE に関するルールは存在しない
+
+**iptables INPUT チェーン (ufw-before-input):**
+```
+$ sudo iptables -L ufw-before-input -n -v
+ 117K  151M ACCEPT     0    --  *      *       0.0.0.0/0            0.0.0.0/0            ctstate RELATED,ESTABLISHED
+```
+- `prot 0` (全プロトコル) で `ctstate RELATED,ESTABLISHED` が大量のパケットを ACCEPT
+
+**GRE パケットの確認:**
+```
+$ sudo tcpdump -i wg0 -c 5 proto gre
+22:15:24.677543 IP 10.8.0.5 > mukai-MS-7B98: GREv0, key=0x1, length 1400: ...
+22:15:24.825175 IP mukai-MS-7B98 > 10.8.0.5: GREv0, key=0x1, length 81: ...
+```
+- GRE パケットは wg0 上を双方向に流れている
+
+**カーネルモジュールの確認:**
+```
+$ lsmod | grep gre
+ip_gre                 40960  0
+ip_tunnel              36864  1 ip_gre
+gre                    12288  1 ip_gre
+```
+- `ip_gre` (GRETAP トンネルドライバ) はロード済み
+- `nf_conntrack_proto_gre` (GRE 専用 conntrack モジュール) はロードされていない
+
+**結論:**
+- GRE 用の ufw ルールは不要
+- ローカル側が GRETAP インターフェース作成時に GRE パケットを送出し、conntrack が
+  送信元/宛先 IP ペアを汎用的にトラッキング (GRE 専用モジュールなしでも `prot 0` ルールでマッチ)
+  → 応答パケットは `ESTABLISHED` として `ufw-before-input` で ACCEPT される
+- README には TCP 39571 (制御チャネル、Primary 側) のみ記載すれば十分
+
 ### 2026-02-21: GBAtempスレッド調査
 - https://gbatemp.net/threads/local-wireless-play-over-internet.516675/ (2018年)
 - 技術的に有用な情報なし。誰も実際には試していない

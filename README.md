@@ -1,3 +1,9 @@
+# ldn-tunneling
+
+Bridge Nintendo Switch LDN sessions across the internet using MAC-spoofed STA relay (proof of concept)
+
+## Setup
+
 ```shellsession
 $ iw dev
 phy#1
@@ -30,6 +36,8 @@ $ # LDN passphrases for some games have been revealed: https://github.com/kinnay
 $ printf 'MarioKart8Delux\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' > mk8dx.bin
 
 $ # --local/--remote take any mutually reachable IPs. Use WireGuard or another VPN if crossing the WAN.
+$ # Allow the control channel on the Primary side (GRETAP is handled by conntrack).
+$ sudo ufw allow from 10.8.0.0/24 to any port 39571 proto tcp
 
 $ # Primary
 $ .venv/bin/python main.py prod.keys --role primary --local 10.8.0.1 --remote 10.8.0.2 --phy phy1 --switch-b-mac 64:B5:C6:1B:14:9B --ldn-passphrase mk8dx.bin
