@@ -31,7 +31,7 @@ from typing import Any, Generator
 
 import trio
 import ldn
-from pyroute2 import IPRoute, protocols
+from pyroute2 import IPRoute, IW, protocols
 from pyroute2.netlink.rtnl import TC_H_ROOT
 
 TRACE = 5
@@ -304,31 +304,67 @@ def cleanup_stale_interfaces(ipr: IPRoute):
 
     Best-effort: individual deletion failures are ignored so the rest can proceed.
     Catches Exception (not bare except) to let KeyboardInterrupt / SystemExit propagate.
+
+    Deletion order matters: tc qdiscs and dependent interfaces (relay, bridge,
+    gretap) must be removed before the nl80211 virtual interfaces (ldn, ldn-mon,
+    ldn-tap) so that nothing holds a reference that prevents deletion.
     """
-    # nl80211 virtual interfaces can also be removed via RTM_DELLINK
-    for ifname in [IF_LDN, IF_LDN_MON, IF_LDN_TAP, IF_RELAY_STA, IF_BRIDGE, IF_GRETAP]:
+    # 1. Remove tc ingress qdisc on ldn (blocks interface deletion)
+    for ifname in [IF_LDN, IF_RELAY_STA]:
+        idx = _ifindex(ipr, ifname)
+        if idx is not None:
+            try:
+                ipr.tc("del", "ingress", index=idx)
+            except Exception as e:
+                logger.debug("tc del ingress %s: %s", ifname, e)
+
+    # 2. Remove dependent interfaces first (relay veth, bridge, gretap)
+    for ifname in [IF_RELAY_STA, IF_BRIDGE, IF_GRETAP]:
         idx = _ifindex(ipr, ifname)
         if idx is not None:
             try:
                 ipr.link("del", index=idx)
-            except Exception:
-                pass
-    # tc ingress qdisc (redundant if ldn was already deleted, but just in case)
-    idx = _ifindex(ipr, IF_LDN)
-    if idx is not None:
+            except Exception as e:
+                logger.debug("link del %s: %s", ifname, e)
+
+    # 3. Remove nl80211 virtual interfaces last
+    #    RTM_DELLINK returns EOPNOTSUPP for nl80211 interfaces on some
+    #    kernels/drivers; fall back to NL80211_CMD_DEL_INTERFACE via pyroute2 IW.
+    nl80211_stale = [
+        (ifname, _ifindex(ipr, ifname))
+        for ifname in [IF_LDN, IF_LDN_MON, IF_LDN_TAP]
+        if _ifindex(ipr, ifname) is not None
+    ]
+    if nl80211_stale:
         try:
-            ipr.tc("del", "ingress", index=idx)
-        except Exception:
-            pass
+            iw = IW()
+        except Exception as e:
+            logger.warning("Cannot open IW socket: %s", e)
+            iw = None
+        for ifname, idx in nl80211_stale:
+            try:
+                ipr.link("del", index=idx)
+            except Exception:
+                if iw is None:
+                    logger.warning("Failed to delete %s (ifindex %d)", ifname, idx)
+                    continue
+                try:
+                    iw.del_interface(idx)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to delete %s (ifindex %d): %s", ifname, idx, e
+                    )
+        if iw is not None:
+            iw.close()
     # stale policy routing entries
     try:
         ipr.rule("del", table=100)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("rule del table 100: %s", e)
     try:
         ipr.flush_routes(table=100)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("flush_routes table 100: %s", e)
 
 
 @contextmanager
@@ -932,6 +968,12 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
         info.address,
         host.ip_address,
         host.mac_address,
+    )
+    logger.debug(
+        "Network details: security_mode=%d ssid=%s server_random=%s",
+        info.security_mode,
+        info.ssid.hex(),
+        info.server_random.hex(),
     )
 
     # 2. GRETAP tunnel + bridge

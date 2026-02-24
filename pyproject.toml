@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "ldn @ git+https://github.com/u1f992/LDN.git@b45165aad9782364ac7c8f158bcab1a205688d4d",
+    "ldn @ git+https://github.com/u1f992/LDN.git@4f7f0e225672187c4d96dcbdceed27a31bbd6d1b",
     "pyroute2>=0.9.5",
 ]
 
