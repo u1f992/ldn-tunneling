@@ -46,7 +46,7 @@ wheels = [
 [[package]]
 name = "ldn"
 version = "0.0.16"
-source = { git = "https://github.com/u1f992/LDN.git?rev=f475645ff4c660a2ee5250901ec43a35ef9fc2d5#f475645ff4c660a2ee5250901ec43a35ef9fc2d5" }
+source = { git = "https://github.com/u1f992/LDN.git?rev=7289995ba07b65ad05ee556b705bec43b3fcd06c#7289995ba07b65ad05ee556b705bec43b3fcd06c" }
 dependencies = [
     { name = "pycryptodome" },
     { name = "python-netlink" },
@@ -61,7 +61,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "ldn", git = "https://github.com/u1f992/LDN.git?rev=f475645ff4c660a2ee5250901ec43a35ef9fc2d5" }]
+requires-dist = [{ name = "ldn", git = "https://github.com/u1f992/LDN.git?rev=7289995ba07b65ad05ee556b705bec43b3fcd06c" }]
 
 [[package]]
 name = "outcome"
