@@ -1079,6 +1079,12 @@ async def main():
         default=DEFAULT_CONTROL_PORT,
         help=f"Control port between Primary and Secondary (default: {DEFAULT_CONTROL_PORT})",
     )
+    parser.add_argument(
+        "--log-level",
+        default="info",
+        choices=["debug", "info", "warning", "error", "critical"],
+        help="Logging verbosity (default: info)",
+    )
     args = parser.parse_args()
     if args.ldn_passphrase is not None:
         with open(args.ldn_passphrase, "rb") as f:
@@ -1095,7 +1101,10 @@ async def main():
         control_port=args.control_port,
     )
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format="%(levelname)s: %(message)s",
+    )
 
     with IPRoute() as ipr:
         cleanup_stale_interfaces(ipr)
