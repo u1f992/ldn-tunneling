@@ -31,7 +31,7 @@ v4 MAC スプーフリレーアーキテクチャ:
 import argparse
 import json
 import types
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from typing import Generator
 
 import trio
@@ -88,6 +88,33 @@ def _veth_create(
         yield (idx, peer_idx[0])
 
 
+@contextmanager
+def _tc_ingress_redirect(
+    ipr: IPRoute, src_idx: int, dst_idx: int
+) -> Generator[None, None, None]:
+    """tc ingress qdisc + u32 mirred redirect を設定し、with 離脱時に削除。"""
+    ipr.tc("add", "ingress", index=src_idx)
+    ipr.tc(
+        "add-filter",
+        "u32",
+        index=src_idx,
+        parent=0xFFFF0000,
+        protocol=protocols.ETH_P_ALL,
+        keys=["0x0/0x0+0"],
+        target=TC_H_ROOT,
+        action={
+            "kind": "mirred",
+            "direction": "egress",
+            "action": "redirect",
+            "ifindex": dst_idx,
+        },
+    )
+    try:
+        yield
+    finally:
+        ipr.tc("del", "ingress", index=src_idx)
+
+
 # --- Network infrastructure ---
 
 
@@ -129,31 +156,26 @@ def setup_tunnel(
     ipr: IPRoute, local_ip, remote_ip
 ) -> Generator[tuple[int, int], None, None]:
     """GRETAP トンネル + br-ldn ブリッジを構築し (idx_gretap, idx_br) を yield する。"""
-    with ExitStack() as stack:
+    with (
         # GRETAP tunnel: key 1, nopmtudisc
         # gre_iflags/gre_oflags=0x2000 = GRE_KEY flag (big-endian)
-        idx_gretap = stack.enter_context(
-            _link_create(
-                ipr,
-                IF_GRETAP,
-                kind="gretap",
-                gre_local=local_ip,
-                gre_remote=remote_ip,
-                gre_ikey=1,
-                gre_okey=1,
-                gre_iflags=0x2000,
-                gre_oflags=0x2000,
-                gre_pmtudisc=0,
-            )
-        )
+        _link_create(
+            ipr,
+            IF_GRETAP,
+            kind="gretap",
+            gre_local=local_ip,
+            gre_remote=remote_ip,
+            gre_ikey=1,
+            gre_okey=1,
+            gre_iflags=0x2000,
+            gre_oflags=0x2000,
+            gre_pmtudisc=0,
+        ) as idx_gretap,
+        _link_create(
+            ipr, IF_BRIDGE, kind="bridge", br_stp_state=0, br_forward_delay=0
+        ) as idx_br,
+    ):
         ipr.link("set", index=idx_gretap, mtu=1500, state="up")
-
-        # Bridge
-        idx_br = stack.enter_context(
-            _link_create(
-                ipr, IF_BRIDGE, kind="bridge", br_stp_state=0, br_forward_delay=0
-            )
-        )
         ipr.link("set", index=idx_br, state="up")
 
         ipr.link("set", index=idx_gretap, master=idx_br)
@@ -191,54 +213,16 @@ def setup_station_relay(
         ipr.brport("set", index=idx_relay_br, learning=0)
         ipr.brport("set", index=idx_gretap, learning=0)
 
-        # tc ingress redirect: station IF → relay-sta
-        ipr.tc("add", "ingress", index=idx_ldn)
-        ipr.tc(
-            "add-filter",
-            "u32",
-            index=idx_ldn,
-            parent=0xFFFF0000,
-            protocol=protocols.ETH_P_ALL,
-            keys=["0x0/0x0+0"],
-            target=TC_H_ROOT,
-            action={
-                "kind": "mirred",
-                "direction": "egress",
-                "action": "redirect",
-                "ifindex": idx_relay_sta,
-            },
-        )
-
-        # tc ingress redirect: relay-sta → station IF
-        ipr.tc("add", "ingress", index=idx_relay_sta)
-        ipr.tc(
-            "add-filter",
-            "u32",
-            index=idx_relay_sta,
-            parent=0xFFFF0000,
-            protocol=protocols.ETH_P_ALL,
-            keys=["0x0/0x0+0"],
-            target=TC_H_ROOT,
-            action={
-                "kind": "mirred",
-                "direction": "egress",
-                "action": "redirect",
-                "ifindex": idx_ldn,
-            },
-        )
-
         _disable_ipv6(ifname)
         _disable_ipv6(IF_RELAY_STA)
         _disable_ipv6(IF_RELAY_BR)
 
-        try:
+        # tc ingress redirect: 双方向
+        with (
+            _tc_ingress_redirect(ipr, idx_ldn, idx_relay_sta),
+            _tc_ingress_redirect(ipr, idx_relay_sta, idx_ldn),
+        ):
             yield
-        finally:
-            # tc ingress qdisc 削除 (IF_LDN は ldn モジュール管理なのでリンク削除はしない)
-            try:
-                ipr.tc("del", "ingress", index=idx_ldn)
-            except NetlinkError:
-                pass
 
 
 def add_tap_to_bridge(
