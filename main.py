@@ -572,8 +572,7 @@ def make_network_msg_from_scan(info: ldn.NetworkInfo) -> NetworkMsg:
     STA 接続せずに全情報を取得できる。
     """
     # network_id: host の IP (169.254.X.1) から第3オクテット X を抽出
-    host_ip = ipaddress.IPv4Address(info.participants[0].ip_address)
-    network_id = host_ip.packed[2]
+    network_id = ipaddress.IPv4Address(info.participants[0].ip_address).packed[2]
 
     participants = tuple(
         [
@@ -868,15 +867,12 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
         return
 
     host = info.participants[0]
-    host_ip = ipaddress.IPv4Address(host.ip_address)
-    network_id = host_ip.packed[2]
     print(
         f"\n  ch={info.channel} proto={info.protocol} ver={info.version}"
         f" app_ver={info.app_version}"
     )
     print(f"  BSSID={info.address}")
-    print(f"  Host: IP={host_ip} MAC={host.mac_address}")
-    print(f"  network_id={network_id}")
+    print(f"  Host: IP={host.ip_address} MAC={host.mac_address}")
     print()
 
     # 2. GRETAP tunnel + bridge
@@ -906,7 +902,8 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                 if fresh_info is None:
                     print("  Network not found!")
                     continue
-                param.network = fresh_info
+                info = fresh_info
+                param.network = info
 
             try:
                 async with ldn.connect(param) as sta:
