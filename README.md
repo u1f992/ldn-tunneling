@@ -29,9 +29,11 @@ $ uv sync
 $ # LDN passphrases for some games have been revealed: https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases
 $ printf 'MarioKart8Delux\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' > mk8dx.bin
 
+$ # --local/--remote take any mutually reachable IPs. Use WireGuard or another VPN if crossing the WAN.
+
 $ # Primary
-$ .venv/bin/python main.py prod.keys --role primary --local <IP> --remote <IP> --phy phy1 --switch-b-mac 64:B5:C6:1B:14:9B --ldn-passphrase mk8dx.bin
+$ .venv/bin/python main.py prod.keys --role primary --local 10.8.0.1 --remote 10.8.0.2 --phy phy1 --switch-b-mac 64:B5:C6:1B:14:9B --ldn-passphrase mk8dx.bin
 
 $ # Secondary
-$ .venv/bin/python main.py prod.keys --role secondary --local <IP> --remote <IP> --phy phy1 --ldn-passphrase mk8dx.bin
+$ .venv/bin/python main.py prod.keys --role secondary --local 10.8.0.2 --remote 10.8.0.1 --phy phy1 --ldn-passphrase mk8dx.bin
 ```
