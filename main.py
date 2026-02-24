@@ -57,10 +57,6 @@ IF_GRETAP = "gretap1"
 # --- pyroute2 helpers ---
 
 
-def _log_netlink(desc: str):
-    print(f"  # [pyroute2] {desc}")
-
-
 def _disable_ipv6(ifname: str):
     """procfs 直書き (sysctl subprocess の代替)"""
     with open(f"/proc/sys/net/ipv6/conf/{ifname}/disable_ipv6", "w") as f:
@@ -136,9 +132,6 @@ def setup_tunnel(
     with ExitStack() as stack:
         # GRETAP tunnel: key 1, nopmtudisc
         # gre_iflags/gre_oflags=0x2000 = GRE_KEY flag (big-endian)
-        _log_netlink(
-            f"link add {IF_GRETAP} type gretap local {local_ip} remote {remote_ip} key 1 nopmtudisc"
-        )
         idx_gretap = stack.enter_context(
             _link_create(
                 ipr,
@@ -153,23 +146,18 @@ def setup_tunnel(
                 gre_pmtudisc=0,
             )
         )
-        _log_netlink(f"link set {IF_GRETAP} mtu 1500 up")
         ipr.link("set", index=idx_gretap, mtu=1500, state="up")
 
         # Bridge
-        _log_netlink(f"link add {IF_BRIDGE} type bridge stp_state 0 forward_delay 0")
         idx_br = stack.enter_context(
             _link_create(
                 ipr, IF_BRIDGE, kind="bridge", br_stp_state=0, br_forward_delay=0
             )
         )
-        _log_netlink(f"link set {IF_BRIDGE} up")
         ipr.link("set", index=idx_br, state="up")
 
-        _log_netlink(f"link set {IF_GRETAP} master {IF_BRIDGE}")
         ipr.link("set", index=idx_gretap, master=idx_br)
 
-        _log_netlink(f"disable_ipv6 {IF_BRIDGE}")
         _disable_ipv6(IF_BRIDGE)
 
         yield (idx_gretap, idx_br)
@@ -190,31 +178,20 @@ def setup_station_relay(
 
     with 離脱時に veth pair と tc ingress qdisc を自動削除。
     """
-    # veth pair 作成 (peer= 指定時は (idx, peer_idx) のタプルを yield)
-    _log_netlink(f"link add {IF_RELAY_STA} type veth peer {IF_RELAY_BR}")
     with _veth_create(ipr, IF_RELAY_STA, IF_RELAY_BR) as (
         idx_relay_sta,
         idx_relay_br,
     ):
-        _log_netlink(f"link set {IF_RELAY_STA} up; link set {IF_RELAY_BR} up")
         ipr.link("set", index=idx_relay_sta, state="up")
         ipr.link("set", index=idx_relay_br, state="up")
 
-        # relay-br を bridge に追加
-        _log_netlink(f"link set {IF_RELAY_BR} master {IF_BRIDGE}")
         ipr.link("set", index=idx_relay_br, master=idx_br)
 
         # MAC learning 無効化 — 全フレームをフラッディング
-        _log_netlink(
-            f"brport set {IF_RELAY_BR} learning off; brport set {IF_GRETAP} learning off"
-        )
         ipr.brport("set", index=idx_relay_br, learning=0)
         ipr.brport("set", index=idx_gretap, learning=0)
 
         # tc ingress redirect: station IF → relay-sta
-        _log_netlink(
-            f"tc add ingress dev {ifname}; tc add-filter u32 mirred redirect → {IF_RELAY_STA}"
-        )
         ipr.tc("add", "ingress", index=idx_ldn)
         ipr.tc(
             "add-filter",
@@ -233,9 +210,6 @@ def setup_station_relay(
         )
 
         # tc ingress redirect: relay-sta → station IF
-        _log_netlink(
-            f"tc add ingress dev {IF_RELAY_STA}; tc add-filter u32 mirred redirect → {ifname}"
-        )
         ipr.tc("add", "ingress", index=idx_relay_sta)
         ipr.tc(
             "add-filter",
@@ -253,8 +227,6 @@ def setup_station_relay(
             },
         )
 
-        # IPv6 無効化
-        _log_netlink(f"disable_ipv6 {ifname}, {IF_RELAY_STA}, {IF_RELAY_BR}")
         _disable_ipv6(ifname)
         _disable_ipv6(IF_RELAY_STA)
         _disable_ipv6(IF_RELAY_BR)
@@ -274,21 +246,15 @@ def add_tap_to_bridge(
 ):
     """Secondary: TAP を br-ldn に追加する。MAC learning 無効化でフラッディング強制。"""
 
-    _log_netlink(f"link set {IF_LDN_TAP} master {IF_BRIDGE}")
     ipr.link("set", index=idx_tap, master=idx_br)
 
-    _log_netlink(
-        f"brport set {IF_LDN_TAP} learning off; brport set {IF_GRETAP} learning off"
-    )
     ipr.brport("set", index=idx_tap, learning=0)
     ipr.brport("set", index=idx_gretap, learning=0)
 
-    _log_netlink(f"disable_ipv6 {IF_LDN_TAP}")
     _disable_ipv6(IF_LDN_TAP)
 
     # 802.11 フレームは Ethernet より大きい (header 24 + CCMP 8 + SNAP 8 + MIC 8 = +34 bytes)
     # MTU 1500 だと大きい Pia パケットの変換後フレームが EMSGSIZE になる
-    _log_netlink(f"link set {IF_LDN_MON} mtu 2304")
     ipr.link("set", index=idx_mon, mtu=2304)
 
 
