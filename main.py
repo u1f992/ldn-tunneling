@@ -1,36 +1,36 @@
-"""LDN Tunnel Node v4 — MAC スプーフ STA リレー
+"""LDN Tunnel Node v4 - MAC-spoofed STA relay
 
 Prerequisites:
   sudo setcap cap_net_admin,cap_net_raw+ep .venv/bin/python
-  # CAP_NET_ADMIN: netlink (nl80211, rtnetlink, tc), /dev/net/tun ioctl, /proc/sys/net 書き込み
-  # CAP_NET_RAW:   AF_PACKET SOCK_RAW ソケット (モニタモードフレーム送受信)
+  # CAP_NET_ADMIN: netlink (nl80211, rtnetlink, tc), /dev/net/tun ioctl, /proc/sys/net writes
+  # CAP_NET_RAW:   AF_PACKET SOCK_RAW sockets (monitor-mode frame I/O)
 
 Usage:
   Primary:   .venv/bin/python main.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1 --switch-b-mac <MAC> --ldn-passphrase <FILE>
   Secondary: .venv/bin/python main.py prod.keys --role secondary --local <wg_ip> --remote <wg_ip> --phy phy1 --ldn-passphrase <FILE>
 
-一部のゲームの LDN パスフレーズは以下で公開されている:
+LDN passphrases for some games are published at:
   https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases
 
-MK8DX の場合:
-  printf 'MarioKart8Delux\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' > mk8dx.pass
+Example (MK8DX):
+  printf 'MarioKart8Delux\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00' > mk8dx.pass
   .venv/bin/python main.py prod.keys --role primary --local 10.0.0.1 --remote 10.0.0.2 --phy phy1 --switch-b-mac 64:B5:C6:1B:14:9B --ldn-passphrase mk8dx.pass
 
-v4 MAC スプーフリレーアーキテクチャ:
-  Primary (PC A):   Switch B の MAC で Switch A の AP に STA 接続。
-                    Switch A は Switch B が直接参加したと認識する。
-                    Pia の AES-GCM nonce (CRC32 に MAC を含む) が一致し、
-                    暗号化通信が透過的に成立する。
-  Secondary (PC B): ldn.create_network() で Switch A の部屋を複製した AP をホスト。
-                    participant 0 を Switch A の情報に書き換え、
-                    Switch B から見て Switch A がホストに見える。
+v4 MAC-spoof relay architecture:
+  Primary (PC A):   Connects to Switch A's AP as STA using Switch B's MAC.
+                    Switch A sees Switch B as a direct participant.
+                    Pia AES-GCM nonces (CRC32 includes MAC) match,
+                    so encrypted traffic is transparently relayed.
+  Secondary (PC B): Hosts a cloned AP via ldn.create_network().
+                    Participant 0 is rewritten to Switch A's info,
+                    so Switch B sees Switch A as the host.
 
-  フロー (--switch-b-mac 事前指定により Switch B 参加前に relay 完成):
-    1. Primary: scan → NETWORK 情報取得
-    2. Primary: tunnel + bridge + STA 接続 (Switch B MAC) + relay 構築
-    3. Primary: Secondary 接続待機 → NETWORK + CONNECTED 送信
-    4. Secondary: AP 作成 → READY
-    5. Switch B が参加 → relay 経由で即座に Pia 通信開始
+  Flow (--switch-b-mac pre-specified; relay is ready before Switch B joins):
+    1. Primary: scan -> obtain NETWORK info
+    2. Primary: tunnel + bridge + STA connect (Switch B MAC) + relay setup
+    3. Primary: wait for Secondary -> send NETWORK + CONNECTED
+    4. Secondary: create AP -> READY
+    5. Switch B joins -> Pia traffic is relayed immediately
 """
 
 import argparse
@@ -104,7 +104,7 @@ class SecondaryConfig(_BaseConfig):
 
 
 class InvalidMessageError(Exception):
-    """制御チャネルで受信したメッセージがデコードできなかった。"""
+    """Received a control-channel message that could not be decoded."""
 
 
 # --- Control messages ---
@@ -149,8 +149,8 @@ class NetworkMsg:
     ]
 
     def __post_init__(self) -> None:
-        # LDNのparticipantスロットは8固定（CreateNetworkParam.max_participants）
-        # see https://github.com/kinnay/NintendoClients/wiki/LDN-Protocol
+        # LDN has exactly 8 participant slots (CreateNetworkParam.max_participants).
+        # See https://github.com/kinnay/NintendoClients/wiki/LDN-Protocol
         if len(self.participants) != ldn.CreateNetworkParam.max_participants:
             raise ValueError(
                 f"participants must have {ldn.CreateNetworkParam.max_participants}"
@@ -237,14 +237,14 @@ def _decode_msg(d: dict[str, Any]) -> ControlMsg:
 
 
 def _disable_ipv6(ifname: str):
-    """procfs 直書きで IPv6 を無効化する (CAP_NET_ADMIN で書き込み可能)。"""
+    """Disable IPv6 on an interface via procfs (requires CAP_NET_ADMIN)."""
     with open(f"/proc/sys/net/ipv6/conf/{ifname}/disable_ipv6", "w") as f:
         f.write("1")
 
 
 @contextmanager
 def _link_create(ipr: IPRoute, ifname: str, **kwargs) -> Generator[int, None, None]:
-    """インターフェースを作成し、yield で ifindex を返す。with 離脱時に自動削除。"""
+    """Create an interface and yield its ifindex. Auto-deleted on context exit."""
     ipr.link("add", ifname=ifname, **kwargs)
     idx = ipr.link_lookup(ifname=ifname)
     if not idx:
@@ -262,7 +262,7 @@ def _link_create(ipr: IPRoute, ifname: str, **kwargs) -> Generator[int, None, No
 def _veth_create(
     ipr: IPRoute, ifname: str, peer: str
 ) -> Generator[tuple[int, int], None, None]:
-    """veth pair を作成し (ifindex, peer_ifindex) を yield する。with 離脱時に自動削除。"""
+    """Create a veth pair and yield (ifindex, peer_ifindex). Auto-deleted on context exit."""
     with _link_create(ipr, ifname, kind="veth", peer=peer) as idx:
         peer_idx = ipr.link_lookup(ifname=peer)
         if not peer_idx:
@@ -274,7 +274,7 @@ def _veth_create(
 def _tc_ingress_redirect(
     ipr: IPRoute, src_idx: int, dst_idx: int
 ) -> Generator[None, None, None]:
-    """tc ingress qdisc + u32 mirred redirect を設定し、with 離脱時に削除。"""
+    """Set up tc ingress qdisc + u32 mirred redirect. Removed on context exit."""
     ipr.tc("add", "ingress", index=src_idx)
     ipr.tc(
         "add-filter",
@@ -309,12 +309,12 @@ def _ifindex(ipr: IPRoute, ifname: str) -> int | None:
 
 
 def cleanup_stale_interfaces(ipr: IPRoute):
-    """前回の異常終了で残った LDN インターフェースを削除する。
+    """Remove LDN interfaces left over from a previous abnormal exit.
 
-    Best-effort: 個々の削除失敗は無視して残りを続行する。
-    KeyboardInterrupt / SystemExit は伝播させたいので bare except ではなく Exception で捕捉。
+    Best-effort: individual deletion failures are ignored so the rest can proceed.
+    Catches Exception (not bare except) to let KeyboardInterrupt / SystemExit propagate.
     """
-    # nl80211 仮想 IF も RTM_DELLINK で削除可能
+    # nl80211 virtual interfaces can also be removed via RTM_DELLINK
     for ifname in [IF_LDN, IF_LDN_MON, IF_LDN_TAP, IF_RELAY_STA, IF_BRIDGE, IF_GRETAP]:
         idx = _ifindex(ipr, ifname)
         if idx is not None:
@@ -322,14 +322,14 @@ def cleanup_stale_interfaces(ipr: IPRoute):
                 ipr.link("del", index=idx)
             except Exception:
                 pass
-    # tc ingress qdisc (ldn が既に削除されていれば不要だが念のため)
+    # tc ingress qdisc (redundant if ldn was already deleted, but just in case)
     idx = _ifindex(ipr, IF_LDN)
     if idx is not None:
         try:
             ipr.tc("del", "ingress", index=idx)
         except Exception:
             pass
-    # policy routing 残骸
+    # stale policy routing entries
     try:
         ipr.rule("del", table=100)
     except Exception:
@@ -344,7 +344,7 @@ def cleanup_stale_interfaces(ipr: IPRoute):
 def setup_tunnel(
     ipr: IPRoute, local_ip: str, remote_ip: str
 ) -> Generator[tuple[int, int], None, None]:
-    """GRETAP トンネル + br-ldn ブリッジを構築し (idx_gretap, idx_br) を yield する。"""
+    """Build a GRETAP tunnel + br-ldn bridge and yield (idx_gretap, idx_br)."""
     with (
         # GRETAP tunnel: key 1, nopmtudisc
         # gre_iflags/gre_oflags=0x2000 = GRE_KEY flag (big-endian)
@@ -378,16 +378,16 @@ def setup_tunnel(
 def setup_station_relay(
     ipr: IPRoute, idx_gretap: int, idx_br: int, idx_ldn: int, ifname: str
 ) -> Generator[None, None, None]:
-    """Primary: station IF と bridge 間の L2 リレーを tc mirred redirect で構成する。
+    """Primary: set up L2 relay between the station IF and the bridge via tc mirred redirect.
 
-    managed-mode WiFi STA は直接 bridge に追加できない (EOPNOTSUPP) ため、
-    veth pair + tc ingress redirect で双方向パケットフォワーディングを行う。
+    A managed-mode WiFi STA cannot be added to a bridge directly (EOPNOTSUPP),
+    so a veth pair + tc ingress redirect provides bidirectional packet forwarding.
 
-    MAC learning を無効化し、全フレームをフラッディングさせる。
-    bridge ポートが 2 つ (relay-br + gretap1) のみなので、
-    フレームは到着ポート以外の全ポート (= もう 1 つ) に転送される。ループなし。
+    MAC learning is disabled to force flooding on all frames.
+    Since the bridge has only 2 ports (relay-br + gretap1),
+    each frame is forwarded to the single other port. No loops.
 
-    with 離脱時に veth pair と tc ingress qdisc を自動削除。
+    The veth pair and tc ingress qdiscs are auto-deleted on context exit.
     """
     with _veth_create(ipr, IF_RELAY_STA, IF_RELAY_BR) as (
         idx_relay_sta,
@@ -398,7 +398,7 @@ def setup_station_relay(
 
         ipr.link("set", index=idx_relay_br, master=idx_br)
 
-        # MAC learning 無効化 — 全フレームをフラッディング
+        # Disable MAC learning to flood all frames
         ipr.brport("set", index=idx_relay_br, learning=0)
         ipr.brport("set", index=idx_gretap, learning=0)
 
@@ -406,7 +406,7 @@ def setup_station_relay(
         _disable_ipv6(IF_RELAY_STA)
         _disable_ipv6(IF_RELAY_BR)
 
-        # tc ingress redirect: 双方向
+        # Bidirectional tc ingress redirect
         with (
             _tc_ingress_redirect(ipr, idx_ldn, idx_relay_sta),
             _tc_ingress_redirect(ipr, idx_relay_sta, idx_ldn),
@@ -417,7 +417,7 @@ def setup_station_relay(
 def add_tap_to_bridge(
     ipr: IPRoute, idx_gretap: int, idx_br: int, idx_tap: int, idx_mon: int
 ):
-    """Secondary: TAP を br-ldn に追加する。MAC learning 無効化でフラッディング強制。"""
+    """Secondary: add TAP to br-ldn. Disable MAC learning to force flooding."""
 
     ipr.link("set", index=idx_tap, master=idx_br)
 
@@ -426,8 +426,8 @@ def add_tap_to_bridge(
 
     _disable_ipv6(IF_LDN_TAP)
 
-    # 802.11 フレームは Ethernet より大きい (header 24 + CCMP 8 + SNAP 8 + MIC 8 = +34 bytes)
-    # MTU 1500 だと大きい Pia パケットの変換後フレームが EMSGSIZE になる
+    # 802.11 frames are larger than Ethernet (header 24 + CCMP 8 + SNAP 8 + MIC 8 = +34 bytes).
+    # With MTU 1500, large Pia packets cause EMSGSIZE after conversion.
     ipr.link("set", index=idx_mon, mtu=2304)
 
 
@@ -437,17 +437,17 @@ def add_tap_to_bridge(
 def patch_secondary_network(
     ipr: IPRoute, network: ldn.APNetwork, net_msg: NetworkMsg, idx_tap: int
 ):
-    """Secondary の APNetwork を Switch A のプロキシとしてパッチする。
+    """Patch the Secondary APNetwork to act as a proxy for Switch A.
 
-    1. _network_id を Switch A のサブネット ID に統一
-    2. participant 0 を Switch A の情報に書き換え
-    3. TAP IP を .254 に設定 — Switch A の IP (.1) を横取りしない
-    4. _register_participant を index 1+ に制限 — index 0=Switch A
+    1. Unify _network_id to Switch A's subnet ID
+    2. Rewrite participant 0 to Switch A's info
+    3. Set TAP IP to .254 so it does not conflict with Switch A's IP (.1)
+    4. Restrict _register_participant to index 1+ (index 0 is reserved for Switch A)
     """
     network_id = net_msg.network_id
     host = net_msg.participants[0]
 
-    # 1. _network_id 統一
+    # 1. Unify _network_id
     network._network_id = network_id
 
     # 2. participant 0 = Switch A
@@ -458,7 +458,7 @@ def patch_secondary_network(
     p0.app_version = host.app_version
     p0.platform = host.platform
 
-    # 3. TAP IP を .254 に設定
+    # 3. Set TAP IP to .254
     ipr.flush_addr(index=idx_tap)
     ipr.addr(
         "add",
@@ -468,7 +468,7 @@ def patch_secondary_network(
         broadcast=f"169.254.{network_id}.255",
     )
 
-    # 4. _register_participant パッチ (index 0=Switch A 予約, 1-7=Switch B+)
+    # 4. Patch _register_participant (index 0 = Switch A reserved, 1-7 = Switch B+)
     async def patched_register(self, address, name, app_version, platform):
         target_index = None
         for idx in range(1, ldn.CreateNetworkParam.max_participants):
@@ -501,7 +501,7 @@ def patch_secondary_network(
 
     network._register_participant = types.MethodType(patched_register, network)
 
-    # アドバタイズメント更新
+    # Update advertisement
     network._update_nonce()
 
 
@@ -514,7 +514,7 @@ def inject_virtual_participant(
     app_version: int,
     platform: int,
 ):
-    """対向拠点の参加者を仮想参加者としてアドバタイズメントに注入する。"""
+    """Inject a remote participant as a virtual participant into the advertisement."""
     network._network.participants[index] = ldn.ParticipantInfo(
         ip_address=ip,
         mac_address=ldn.MACAddress(mac_str),
@@ -528,7 +528,7 @@ def inject_virtual_participant(
 
 
 def remove_virtual_participant(network: ldn.APNetwork, index: int):
-    """仮想参加者をアドバタイズメントから除去する。"""
+    """Remove a virtual participant from the advertisement."""
     participant = network._network.participants[index]
     if participant.connected:
         participant.connected = False
@@ -540,7 +540,7 @@ def remove_virtual_participant(network: ldn.APNetwork, index: int):
 
 
 class LineReader:
-    """trio.SocketStream をラップして行単位の読み取りを提供する。"""
+    """Wraps a trio.SocketStream to provide line-oriented reading."""
 
     def __init__(self, stream: trio.SocketStream):
         self.stream = stream
@@ -572,12 +572,12 @@ async def recv_msg(reader: LineReader) -> ControlMsg:
 
 
 def make_network_msg_from_scan(info: ldn.NetworkInfo) -> NetworkMsg:
-    """scan 結果の NetworkInfo を NetworkMsg に変換する。
+    """Convert a scan NetworkInfo into a NetworkMsg.
 
-    scan() が返す NetworkInfo は advertisement frame を解析した結果であり、
-    STA 接続せずに全情報を取得できる。
+    scan() returns a NetworkInfo parsed from an advertisement frame,
+    so all information is available without STA association.
     """
-    # network_id: host の IP (169.254.X.1) から第3オクテット X を抽出
+    # Extract the 3rd octet X from the host IP (169.254.X.1) as network_id
     network_id = ipaddress.IPv4Address(info.participants[0].ip_address).packed[2]
 
     participants = tuple(
@@ -603,8 +603,8 @@ def make_network_msg_from_scan(info: ldn.NetworkInfo) -> NetworkMsg:
                 app_version=0,
                 platform=0,
             )
-            # LDNのparticipantスロットは8固定（CreateNetworkParam.max_participants）
-            # see https://github.com/kinnay/NintendoClients/wiki/LDN-Protocol
+            # LDN has exactly 8 participant slots (CreateNetworkParam.max_participants).
+            # See https://github.com/kinnay/NintendoClients/wiki/LDN-Protocol
             for i in range(
                 len(info.participants), ldn.CreateNetworkParam.max_participants
             )
@@ -630,10 +630,11 @@ def make_network_msg_from_scan(info: ldn.NetworkInfo) -> NetworkMsg:
 
 
 def pick_secondary_channel(primary_channel: int) -> int:
-    """Secondary AP を Primary とは別のチャネルで運用する。
+    """Pick a different channel for the Secondary AP.
 
-    同一チャネルだと Switch A が spoofed STA と実 Switch B の MAC 衝突を検知し
-    disassociate する。2.4 GHz 非重複チャネル (1, 6, 11) から選択。
+    Using the same channel causes Switch A to detect a MAC collision between
+    the spoofed STA and the real Switch B, triggering disassociation.
+    Picks from the 2.4 GHz non-overlapping channels (1, 6, 11).
     """
     non_overlapping = [1, 6, 11]
     candidates = [ch for ch in non_overlapping if ch != primary_channel]
@@ -643,7 +644,7 @@ def pick_secondary_channel(primary_channel: int) -> int:
 def make_create_param(
     keys: dict[str, bytes], phy: str, msg: NetworkMsg, passphrase: bytes
 ) -> ldn.CreateNetworkParam:
-    """NetworkMsg から CreateNetworkParam を構築する。"""
+    """Build a CreateNetworkParam from a NetworkMsg."""
     return ldn.CreateNetworkParam(
         keys=keys,
         phyname=phy,
@@ -706,10 +707,10 @@ async def scan_ldn(keys: dict[str, bytes], phy: str) -> ldn.NetworkInfo | None:
 async def handle_primary_events(
     sta: ldn.STANetwork, peer_stream: trio.SocketStream, relay_mac: str
 ) -> None:
-    """Primary: STANetwork のイベントを監視し、制御チャネルで Secondary に転送する。
+    """Primary: monitor STANetwork events and forward them to Secondary via the control channel.
 
-    relay_mac: 自身の STA MAC (= Switch B の MAC)。
-    自分自身の JoinEvent はフィルタして Secondary に転送しない。
+    relay_mac is our own STA MAC (= Switch B's MAC).
+    Our own JoinEvent is filtered out and not forwarded to Secondary.
     """
     try:
         while True:
@@ -717,7 +718,7 @@ async def handle_primary_events(
             match event:
                 case ldn.JoinEvent():
                     p = event.participant
-                    # 自身の参加イベントはスキップ
+                    # Skip our own join event
                     if str(p.mac_address) == relay_mac:
                         print(
                             f"  [PRIMARY JOIN] idx={event.index} (self, skipping relay)"
@@ -752,9 +753,9 @@ async def handle_primary_events(
 async def handle_secondary_events(
     network: ldn.APNetwork, peer_stream: trio.SocketStream
 ) -> None:
-    """Secondary: APNetwork のローカルイベントを監視し、Primary に転送する。
+    """Secondary: monitor local APNetwork events and forward them to Primary.
 
-    Switch B が参加/離脱した際に Primary へ通知する。
+    Notifies Primary when Switch B joins or leaves.
     """
     while True:
         event = await network.next_event()
@@ -777,10 +778,10 @@ async def handle_secondary_events(
 
 
 async def handle_peer_messages_primary(reader: LineReader) -> None:
-    """Primary: Secondary からのメッセージを処理する。
+    """Primary: process messages from Secondary.
 
-    LEAVE はログに記録するのみ (自動終了しない)。
-    TCP 切断時のみ return → nursery cancel。
+    LEAVE is logged only (no automatic shutdown).
+    Returns only on TCP disconnect, which triggers nursery cancellation.
     """
     while True:
         try:
@@ -796,7 +797,7 @@ async def handle_peer_messages_primary(reader: LineReader) -> None:
             case LeaveMsg():
                 print(f"  [REMOTE LEAVE] idx={msg.index} (continuing relay)")
             case JoinMsg():
-                # 追加の参加者 (将来対応)
+                # Additional participants (future support)
                 print(
                     f"  [REMOTE JOIN] idx={msg.index}"
                     f" IP={msg.ip} MAC={msg.mac}"
@@ -807,7 +808,7 @@ async def handle_peer_messages_primary(reader: LineReader) -> None:
 async def handle_peer_messages_secondary(
     network: ldn.APNetwork, reader: LineReader
 ) -> None:
-    """Secondary: Primary からの JOIN/LEAVE/APP_DATA/ACCEPT を処理する。"""
+    """Secondary: process JOIN/LEAVE/APP_DATA/ACCEPT messages from Primary."""
     while True:
         try:
             msg = await recv_msg(reader)
@@ -846,7 +847,7 @@ async def handle_peer_messages_secondary(
                     f"  [CONNECTED] Primary STA assigned:"
                     f" idx={primary_idx} IP={primary_ip}"
                 )
-                # Switch B の IP と一致するか確認
+                # Verify that the IP matches Switch B's
                 for idx, p in enumerate(network._network.participants):
                     if p.connected and idx > 0:
                         if p.ip_address != primary_ip:
@@ -863,9 +864,9 @@ async def handle_peer_messages_secondary(
 
 
 async def run_primary(ipr: IPRoute, config: PrimaryConfig):
-    # 1. Scan (STA 接続はしない — scan 結果から全情報を取得)
+    # 1. Scan (no STA association; all info is obtained from the scan result)
     print("=== 1. Scan for LDN network ===")
-    print("Switch A でローカル通信の部屋を作ってください")
+    print("Create a local-communication room on Switch A")
     print()
     info = await scan_ldn(config.keys, config.phy)
     if info is None:
@@ -886,7 +887,7 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
     with setup_tunnel(ipr, config.local, config.remote) as (idx_gretap, idx_br):
         print()
 
-        # 3. STA 接続 (Switch B 参加前に relay を完成させる)
+        # 3. STA connect (complete the relay before Switch B joins)
         print(f"=== 3. Connecting to Switch A as {config.switch_b_mac} ===")
         param = ldn.ConnectNetworkParam(
             keys=config.keys,
@@ -920,14 +921,14 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                     print(f"  MAC: {config.switch_b_mac} (spoofed)")
                     print()
 
-                    # 4. Relay 構築 (Switch B 参加前に完成)
+                    # 4. Relay setup (completed before Switch B joins)
                     print("=== 4. Setting up relay ===")
                     with setup_station_relay(
                         ipr, idx_gretap, idx_br, sta.ifindex, IF_LDN
                     ):
                         print()
 
-                        # 5. Secondary 待機
+                        # 5. Wait for Secondary
                         listeners = await trio.open_tcp_listeners(
                             config.control_port, host=config.local
                         )
@@ -943,7 +944,7 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                             reader = LineReader(peer_stream)
                             print("  Secondary connected!")
 
-                            # 6. NETWORK + CONNECTED 送信
+                            # 6. Send NETWORK + CONNECTED
                             net_msg = make_network_msg_from_scan(info)
                             await send_msg(peer_stream, net_msg)
                             await send_msg(
@@ -973,9 +974,9 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                             print()
 
                             print("=== Ready ===")
-                            print("Switch B で「ローカル通信」から参加してください")
-                            print("Pia 通信が透過的にリレーされます")
-                            print("Ctrl+C で終了")
+                            print("Join via local communication on Switch B")
+                            print("Pia traffic will be transparently relayed")
+                            print("Ctrl+C to exit")
                             print()
 
                             # 7. Event loop
@@ -999,7 +1000,7 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                             for listener in listeners:
                                 await listener.aclose()
 
-                    # Event loop 正常終了 → retry 不要
+                    # Event loop exited normally; no retry needed
                     break
             except ConnectionError as e:
                 print(f"  Connect failed: {e}")
@@ -1052,7 +1053,7 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
         )
 
         async with ldn.create_network(param) as network:
-            # 5. Patch: Switch A のプロキシとして構成
+            # 5. Patch: configure as Switch A proxy
             patch_secondary_network(ipr, network, net_msg, network.ifindex_tap)
 
             # 6. Bridge TAP
@@ -1067,8 +1068,8 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
             print(f"  participant 0 (Switch A): {host_p.ip} {host_p.mac}")
             print()
             print("=== Ready ===")
-            print("Switch B で「ローカル通信」から参加してください")
-            print("Ctrl+C で終了")
+            print("Join via local communication on Switch B")
+            print("Ctrl+C to exit")
             print()
 
             async with trio.open_nursery() as nursery:
@@ -1078,32 +1079,32 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
 
 async def main():
     parser = argparse.ArgumentParser(description="LDN Tunnel Node v4")
-    parser.add_argument("keys", help="prod.keys のパス")
+    parser.add_argument("keys", help="Path to prod.keys")
     parser.add_argument(
         "--role",
         required=True,
         choices=["primary", "secondary"],
-        help="primary: MAC スプーフ STA リレー、secondary: AP プロキシ",
+        help="primary: MAC-spoofed STA relay, secondary: AP proxy",
     )
-    parser.add_argument("--local", required=True, help="ローカル WireGuard IP")
-    parser.add_argument("--remote", required=True, help="リモート WireGuard IP")
-    parser.add_argument("--phy", required=True, help="Wi-Fi phy 名 (例: phy1)")
+    parser.add_argument("--local", required=True, help="Local WireGuard IP")
+    parser.add_argument("--remote", required=True, help="Remote WireGuard IP")
+    parser.add_argument("--phy", required=True, help="Wi-Fi phy name (e.g. phy1)")
     parser.add_argument(
         "--switch-b-mac",
         default=None,
-        help="Switch B の MAC アドレス (例: 64:B5:C6:1B:14:9B)",
+        help="Switch B MAC address (e.g. 64:B5:C6:1B:14:9B)",
     )
     parser.add_argument(
         "--ldn-passphrase",
         default=None,
-        help="LDN パスフレーズを格納したバイナリファイルのパス (省略時は空). "
-        "参照: https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases",
+        help="Path to binary file containing the LDN passphrase (empty if omitted). "
+        "See: https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases",
     )
     parser.add_argument(
         "--control-port",
         type=int,
         default=DEFAULT_CONTROL_PORT,
-        help=f"Primary-Secondary 間の制御ポート (default: {DEFAULT_CONTROL_PORT})",
+        help=f"Control port between Primary and Secondary (default: {DEFAULT_CONTROL_PORT})",
     )
     args = parser.parse_args()
     if args.ldn_passphrase is not None:
