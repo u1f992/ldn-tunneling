@@ -37,7 +37,6 @@ from typing import Generator
 import trio
 import ldn
 from pyroute2 import IPRoute, protocols
-from pyroute2.netlink.exceptions import NetlinkError
 from pyroute2.netlink.rtnl import TC_H_ROOT
 
 
@@ -59,7 +58,7 @@ IF_GRETAP = "gretap1"
 
 @dataclass(frozen=True)
 class _BaseConfig:
-    keys: str
+    keys: dict[str, bytes]
     phy: str
     ldn_passphrase: bytes | None
     local: str
@@ -68,7 +67,7 @@ class _BaseConfig:
 
     def __post_init__(self):
         for field, expected in {
-            "keys": str,
+            "keys": dict,
             "phy": str,
             "ldn_passphrase": (bytes, type(None)),
             "local": str,
@@ -166,30 +165,34 @@ def _ifindex(ipr: IPRoute, ifname: str) -> int | None:
 
 
 def cleanup_stale_interfaces(ipr: IPRoute):
-    """前回の異常終了で残った LDN インターフェースを削除する。"""
+    """前回の異常終了で残った LDN インターフェースを削除する。
+
+    Best-effort: 個々の削除失敗は無視して残りを続行する。
+    KeyboardInterrupt / SystemExit は伝播させたいので bare except ではなく Exception で捕捉。
+    """
     # nl80211 仮想 IF も RTM_DELLINK で削除可能
     for ifname in [IF_LDN, IF_LDN_MON, IF_LDN_TAP, IF_RELAY_STA, IF_BRIDGE, IF_GRETAP]:
         idx = _ifindex(ipr, ifname)
         if idx is not None:
             try:
                 ipr.link("del", index=idx)
-            except NetlinkError:
+            except Exception:
                 pass
     # tc ingress qdisc (ldn が既に削除されていれば不要だが念のため)
     idx = _ifindex(ipr, IF_LDN)
     if idx is not None:
         try:
             ipr.tc("del", "ingress", index=idx)
-        except NetlinkError:
+        except Exception:
             pass
     # policy routing 残骸
     try:
         ipr.rule("del", table=100)
-    except NetlinkError:
+    except Exception:
         pass
     try:
         ipr.flush_routes(table=100)
-    except NetlinkError:
+    except Exception:
         pass
 
 
@@ -697,13 +700,11 @@ async def handle_peer_messages_secondary(network, reader):
 
 
 async def run_primary(ipr: IPRoute, config: PrimaryConfig):
-    keys = ldn.load_keys(config.keys)
-
     # 1. Scan (STA 接続はしない — scan 結果から全情報を取得)
     print("=== 1. Scan for LDN network ===")
     print("Switch A でローカル通信の部屋を作ってください")
     print()
-    info = await scan_ldn(keys, config.phy)
+    info = await scan_ldn(config.keys, config.phy)
     if info is None:
         print("LDN network not found.")
         return
@@ -728,7 +729,7 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
         # 3. STA 接続 (Switch B 参加前に relay を完成させる)
         print(f"=== 3. Connecting to Switch A as {config.switch_b_mac} ===")
         param = ldn.ConnectNetworkParam()
-        param.keys = keys
+        param.keys = config.keys
         param.phyname = config.phy
         param.network = info
         param.password = config.ldn_passphrase or b""
@@ -742,7 +743,7 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                 await trio.sleep(2)
                 # Re-scan for fresh NetworkInfo
                 print("  Re-scanning...")
-                fresh_info = await scan_ldn(keys, config.phy)
+                fresh_info = await scan_ldn(config.keys, config.phy)
                 if fresh_info is None:
                     print("  Network not found!")
                     continue
@@ -840,8 +841,6 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
 
 
 async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
-    keys = ldn.load_keys(config.keys)
-
     # 1. GRETAP + bridge
     print("=== 1. GRETAP tunnel + bridge ===")
     with setup_tunnel(ipr, config.local, config.remote) as (idx_gretap, idx_br):
@@ -871,7 +870,7 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
         # 4. Host proxy LDN
         print("=== 3. Hosting proxy LDN network ===")
         param = make_create_param(
-            keys, config.phy, net_msg, config.ldn_passphrase or b""
+            config.keys, config.phy, net_msg, config.ldn_passphrase or b""
         )
 
         async with ldn.create_network(param) as network:
@@ -936,7 +935,7 @@ async def main():
         passphrase = None
 
     common = dict(
-        keys=args.keys,
+        keys=ldn.load_keys(args.keys),
         phy=args.phy,
         ldn_passphrase=passphrase,
         local=args.local,
