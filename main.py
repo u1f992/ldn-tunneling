@@ -34,7 +34,6 @@ from pyroute2.netlink.rtnl import TC_H_ROOT
 
 # --- Constants ---
 
-MK8DX_GAME_ID = 0x0100152000022000
 MK8DX_PASSWORD = (
     b"MarioKart8Delux" + b"\x00" * 17
 )  # https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases
@@ -524,7 +523,7 @@ def make_leave_msg(index):
 # --- LDN scan ---
 
 
-async def scan_mk8dx(keys, phy):
+async def scan_ldn(keys, phy):
     for attempt in range(10):
         print(f"Scan {attempt + 1}/10...", end=" ", flush=True)
         networks = await ldn.scan(
@@ -536,9 +535,8 @@ async def scan_mk8dx(keys, phy):
             protocols=[1, 3],
         )
         print(f"{len(networks)} found")
-        for net in networks:
-            if net.local_communication_id == MK8DX_GAME_ID:
-                return net
+        if networks:
+            return networks[0]
     return None
 
 
@@ -705,7 +703,7 @@ async def run_primary(ipr: IPRoute, args):
     print("=== 1. Scan for MK8DX ===")
     print("Switch A でローカル通信の部屋を作ってください")
     print()
-    info = await scan_mk8dx(keys, args.phy)
+    info = await scan_ldn(keys, args.phy)
     if info is None:
         print("MK8DX network not found.")
         return
@@ -792,7 +790,7 @@ async def run_primary(ipr: IPRoute, args):
                 await trio.sleep(2)
                 # Re-scan for fresh NetworkInfo
                 print("  Re-scanning...")
-                fresh_info = await scan_mk8dx(keys, args.phy)
+                fresh_info = await scan_ldn(keys, args.phy)
                 if fresh_info is None:
                     print("  Network not found!")
                     continue
