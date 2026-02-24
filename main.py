@@ -32,8 +32,8 @@ import dataclasses
 import json
 import types
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Any, ClassVar, Generator
+from dataclasses import dataclass, field
+from typing import Any, Generator
 
 import trio
 import ldn
@@ -67,7 +67,7 @@ class _BaseConfig:
     control_port: int
 
     def __post_init__(self):
-        for field, expected in {
+        for name, expected in {
             "keys": dict,
             "phy": str,
             "ldn_passphrase": (bytes, type(None)),
@@ -75,9 +75,9 @@ class _BaseConfig:
             "remote": str,
             "control_port": int,
         }.items():
-            if not isinstance(getattr(self, field), expected):
+            if not isinstance(getattr(self, name), expected):
                 raise TypeError(
-                    f"--{field.replace('_', '-')} must be {expected.__name__}"
+                    f"--{name.replace('_', '-')} must be {expected.__name__}"
                 )
 
 
@@ -116,7 +116,7 @@ class NetworkParticipant:
 
 @dataclass(frozen=True)
 class NetworkMsg:
-    _tag: ClassVar[str] = "network"
+    type: str = field(init=False, default="network")
     network_id: int
     local_communication_id: int
     scene_id: int
@@ -130,24 +130,42 @@ class NetworkMsg:
     application_data: str
     server_random: str
     ssid: str
-    participants: list[NetworkParticipant]
+    participants: tuple[
+        NetworkParticipant,
+        NetworkParticipant,
+        NetworkParticipant,
+        NetworkParticipant,
+        NetworkParticipant,
+        NetworkParticipant,
+        NetworkParticipant,
+        NetworkParticipant,
+    ]
+
+    def __post_init__(self) -> None:
+        # LDNのparticipantスロットは8固定（CreateNetworkParam.max_participants）
+        # see https://github.com/kinnay/NintendoClients/wiki/LDN-Protocol
+        if len(self.participants) != ldn.CreateNetworkParam.max_participants:
+            raise ValueError(
+                f"participants must have {ldn.CreateNetworkParam.max_participants}"
+                f" elements, got {len(self.participants)}"
+            )
 
 
 @dataclass(frozen=True)
 class ConnectedMsg:
-    _tag: ClassVar[str] = "connected"
+    type: str = field(init=False, default="connected")
     index: int
     ip: str
 
 
 @dataclass(frozen=True)
 class ReadyMsg:
-    _tag: ClassVar[str] = "ready"
+    type: str = field(init=False, default="ready")
 
 
 @dataclass(frozen=True)
 class JoinMsg:
-    _tag: ClassVar[str] = "join"
+    type: str = field(init=False, default="join")
     index: int
     ip: str
     mac: str
@@ -158,19 +176,19 @@ class JoinMsg:
 
 @dataclass(frozen=True)
 class LeaveMsg:
-    _tag: ClassVar[str] = "leave"
+    type: str = field(init=False, default="leave")
     index: int
 
 
 @dataclass(frozen=True)
 class AppDataMsg:
-    _tag: ClassVar[str] = "app_data"
+    type: str = field(init=False, default="app_data")
     data: str
 
 
 @dataclass(frozen=True)
 class AcceptMsg:
-    _tag: ClassVar[str] = "accept"
+    type: str = field(init=False, default="accept")
     policy: int
 
 
@@ -190,9 +208,7 @@ _MSG_REGISTRY: dict[str, type] = {
 
 
 def _encode_msg(msg: ControlMsg) -> bytes:
-    d = dataclasses.asdict(msg)
-    d["type"] = msg._tag
-    return json.dumps(d).encode() + b"\n"
+    return json.dumps(dataclasses.asdict(msg)).encode() + b"\n"
 
 
 def _decode_msg(d: dict[str, Any]) -> ControlMsg:
@@ -202,7 +218,9 @@ def _decode_msg(d: dict[str, Any]) -> ControlMsg:
         raise InvalidMessageError(f"Unknown message type: {tag!r}")
     try:
         if cls is NetworkMsg:
-            d["participants"] = [NetworkParticipant(**p) for p in d["participants"]]
+            d["participants"] = tuple(
+                NetworkParticipant(**p) for p in d["participants"]
+            )
         return cls(**d)
     except Exception as e:
         raise InvalidMessageError(f"Malformed {tag!r} message: {e}") from e
@@ -598,7 +616,7 @@ def make_network_msg_from_scan(info: ldn.NetworkInfo) -> NetworkMsg:
         application_data=info.application_data.hex(),
         server_random=info.server_random.hex(),
         ssid=info.ssid.hex(),
-        participants=participants,
+        participants=tuple(participants),  # type: ignore[arg-type]
     )
 
 
