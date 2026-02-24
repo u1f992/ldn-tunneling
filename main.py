@@ -100,6 +100,17 @@ class SecondaryConfig(_BaseConfig):
 
 
 @dataclass(frozen=True)
+class NetworkParticipant:
+    index: int
+    ip: str
+    mac: str
+    connected: bool
+    name: str
+    app_version: int
+    platform: int
+
+
+@dataclass(frozen=True)
 class NetworkMsg:
     _tag: ClassVar[str] = "network"
     network_id: int
@@ -115,7 +126,18 @@ class NetworkMsg:
     application_data: str
     server_random: str
     ssid: str
-    participants: list[dict[str, Any]]
+    participants: list[NetworkParticipant]
+
+    def __post_init__(self) -> None:
+        # _decode_msg 経由では participants が list[dict] で渡される
+        object.__setattr__(
+            self,
+            "participants",
+            [
+                NetworkParticipant(**p) if isinstance(p, dict) else p
+                for p in self.participants
+            ],
+        )
 
 
 @dataclass(frozen=True)
@@ -407,11 +429,11 @@ def patch_secondary_network(
 
     # 2. participant 0 = Switch A
     p0 = network._network.participants[0]
-    p0.ip_address = host["ip"]
-    p0.mac_address = ldn.MACAddress(host["mac"])
-    p0.name = bytes.fromhex(host["name"])
-    p0.app_version = host["app_version"]
-    p0.platform = host["platform"]
+    p0.ip_address = host.ip
+    p0.mac_address = ldn.MACAddress(host.mac)
+    p0.name = bytes.fromhex(host.name)
+    p0.app_version = host.app_version
+    p0.platform = host.platform
 
     # 3. TAP IP を .254 に設定
     ipr.flush_addr(index=idx_tap)
@@ -426,7 +448,7 @@ def patch_secondary_network(
     # 4. _register_participant パッチ (index 0=Switch A 予約, 1-7=Switch B+)
     async def patched_register(self, address, name, app_version, platform):
         target_index = None
-        for idx in range(1, 8):
+        for idx in range(1, ldn.CreateNetworkParam.max_participants):
             if not self._network.participants[idx].connected:
                 target_index = idx
                 break
@@ -538,31 +560,32 @@ def make_network_msg_from_scan(info: ldn.NetworkInfo) -> NetworkMsg:
     host_ip = info.participants[0].ip_address
     network_id = int(host_ip.split(".")[2])
 
-    participants = []
+    participants: list[NetworkParticipant] = []
     for i, p in enumerate(info.participants):
         participants.append(
-            {
-                "index": i,
-                "ip": p.ip_address,
-                "mac": str(p.mac_address),
-                "connected": p.connected,
-                "name": p.name.hex() if p.name else "",
-                "app_version": p.app_version,
-                "platform": p.platform,
-            }
+            NetworkParticipant(
+                index=i,
+                ip=p.ip_address,
+                mac=str(p.mac_address),
+                connected=p.connected,
+                name=p.name.hex() if p.name else "",
+                app_version=p.app_version,
+                platform=p.platform,
+            )
         )
-    # 8 エントリに満たない場合はパディング
-    for i in range(len(info.participants), 8):
+    # LDNのparticipantスロットは8固定（CreateNetworkParam.max_participants）
+    # see https://github.com/kinnay/NintendoClients/wiki/LDN-Protocol
+    for i in range(len(info.participants), ldn.CreateNetworkParam.max_participants):
         participants.append(
-            {
-                "index": i,
-                "ip": "",
-                "mac": "00:00:00:00:00:00",
-                "connected": False,
-                "name": "",
-                "app_version": 0,
-                "platform": 0,
-            }
+            NetworkParticipant(
+                index=i,
+                ip="",
+                mac="00:00:00:00:00:00",
+                connected=False,
+                name="",
+                app_version=0,
+                platform=0,
+            )
         )
 
     return NetworkMsg(
@@ -668,34 +691,37 @@ async def handle_primary_events(
     try:
         while True:
             event = await sta.next_event()
-            if isinstance(event, ldn.JoinEvent):
-                p = event.participant
-                # 自身の参加イベントはスキップ
-                if str(p.mac_address) == relay_mac:
-                    print(f"  [PRIMARY JOIN] idx={event.index} (self, skipping relay)")
-                    continue
-                print(
-                    f"  [PRIMARY JOIN] idx={event.index}"
-                    f" {p.name.decode(errors='replace')}"
-                    f" IP={p.ip_address} MAC={p.mac_address}"
-                )
-                await send_msg(peer_stream, make_join_msg(event.index, p))
-            elif isinstance(event, ldn.LeaveEvent):
-                p = event.participant
-                print(
-                    f"  [PRIMARY LEAVE] idx={event.index}"
-                    f" {p.name.decode(errors='replace')}"
-                )
-                await send_msg(peer_stream, make_leave_msg(event.index))
-            elif isinstance(event, ldn.ApplicationDataChanged):
-                print(f"  [APP_DATA] {len(event.new)} bytes")
-                await send_msg(peer_stream, AppDataMsg(data=event.new.hex()))
-            elif isinstance(event, ldn.AcceptPolicyChanged):
-                print(f"  [ACCEPT] {event.old} -> {event.new}")
-                await send_msg(peer_stream, AcceptMsg(policy=event.new))
-            elif isinstance(event, ldn.DisconnectEvent):
-                print(f"  [DISCONNECT] reason={event.reason}")
-                break
+            match event:
+                case ldn.JoinEvent():
+                    p = event.participant
+                    # 自身の参加イベントはスキップ
+                    if str(p.mac_address) == relay_mac:
+                        print(
+                            f"  [PRIMARY JOIN] idx={event.index} (self, skipping relay)"
+                        )
+                        continue
+                    print(
+                        f"  [PRIMARY JOIN] idx={event.index}"
+                        f" {p.name.decode(errors='replace')}"
+                        f" IP={p.ip_address} MAC={p.mac_address}"
+                    )
+                    await send_msg(peer_stream, make_join_msg(event.index, p))
+                case ldn.LeaveEvent():
+                    p = event.participant
+                    print(
+                        f"  [PRIMARY LEAVE] idx={event.index}"
+                        f" {p.name.decode(errors='replace')}"
+                    )
+                    await send_msg(peer_stream, make_leave_msg(event.index))
+                case ldn.ApplicationDataChanged():
+                    print(f"  [APP_DATA] {len(event.new)} bytes")
+                    await send_msg(peer_stream, AppDataMsg(data=event.new.hex()))
+                case ldn.AcceptPolicyChanged():
+                    print(f"  [ACCEPT] {event.old} -> {event.new}")
+                    await send_msg(peer_stream, AcceptMsg(policy=event.new))
+                case ldn.DisconnectEvent():
+                    print(f"  [DISCONNECT] reason={event.reason}")
+                    break
     except (trio.ClosedResourceError, trio.BrokenResourceError):
         pass
 
@@ -709,21 +735,22 @@ async def handle_secondary_events(
     """
     while True:
         event = await network.next_event()
-        if isinstance(event, ldn.JoinEvent):
-            p = event.participant
-            print(
-                f"  [SECONDARY JOIN] idx={event.index}"
-                f" {p.name.decode(errors='replace')}"
-                f" IP={p.ip_address} MAC={p.mac_address}"
-            )
-            await send_msg(peer_stream, make_join_msg(event.index, p))
-        elif isinstance(event, ldn.LeaveEvent):
-            p = event.participant
-            print(
-                f"  [SECONDARY LEAVE] idx={event.index}"
-                f" {p.name.decode(errors='replace')}"
-            )
-            await send_msg(peer_stream, make_leave_msg(event.index))
+        match event:
+            case ldn.JoinEvent():
+                p = event.participant
+                print(
+                    f"  [SECONDARY JOIN] idx={event.index}"
+                    f" {p.name.decode(errors='replace')}"
+                    f" IP={p.ip_address} MAC={p.mac_address}"
+                )
+                await send_msg(peer_stream, make_join_msg(event.index, p))
+            case ldn.LeaveEvent():
+                p = event.participant
+                print(
+                    f"  [SECONDARY LEAVE] idx={event.index}"
+                    f" {p.name.decode(errors='replace')}"
+                )
+                await send_msg(peer_stream, make_leave_msg(event.index))
 
 
 async def handle_peer_messages_primary(reader: LineReader) -> None:
@@ -739,15 +766,16 @@ async def handle_peer_messages_primary(reader: LineReader) -> None:
             print("  [CTRL] Secondary disconnected")
             break
 
-        if isinstance(msg, LeaveMsg):
-            print(f"  [REMOTE LEAVE] idx={msg.index} (continuing relay)")
-        elif isinstance(msg, JoinMsg):
-            # 追加の参加者 (将来対応)
-            print(
-                f"  [REMOTE JOIN] idx={msg.index}"
-                f" IP={msg.ip} MAC={msg.mac}"
-                f" (additional participant, not yet supported)"
-            )
+        match msg:
+            case LeaveMsg():
+                print(f"  [REMOTE LEAVE] idx={msg.index} (continuing relay)")
+            case JoinMsg():
+                # 追加の参加者 (将来対応)
+                print(
+                    f"  [REMOTE JOIN] idx={msg.index}"
+                    f" IP={msg.ip} MAC={msg.mac}"
+                    f" (additional participant, not yet supported)"
+                )
 
 
 async def handle_peer_messages_secondary(
@@ -761,43 +789,45 @@ async def handle_peer_messages_secondary(
             print("  [CTRL] Primary disconnected")
             break
 
-        if isinstance(msg, JoinMsg):
-            print(f"  [REMOTE JOIN] idx={msg.index} IP={msg.ip} MAC={msg.mac}")
-            inject_virtual_participant(
-                network,
-                index=msg.index,
-                ip=msg.ip,
-                mac_str=msg.mac,
-                name=bytes.fromhex(msg.name),
-                app_version=msg.app_version,
-                platform=msg.platform,
-            )
-        elif isinstance(msg, LeaveMsg):
-            print(f"  [REMOTE LEAVE] idx={msg.index}")
-            remove_virtual_participant(network, msg.index)
-        elif isinstance(msg, AppDataMsg):
-            print(f"  [APP_DATA] updating ({len(msg.data) // 2} bytes)")
-            network.set_application_data(bytes.fromhex(msg.data))
-        elif isinstance(msg, AcceptMsg):
-            print(f"  [ACCEPT] policy={msg.policy}")
-            network.set_accept_policy(msg.policy)
-        elif isinstance(msg, ConnectedMsg):
-            primary_idx = msg.index
-            primary_ip = msg.ip
-            print(
-                f"  [CONNECTED] Primary STA assigned: idx={primary_idx} IP={primary_ip}"
-            )
-            # Switch B の IP と一致するか確認
-            for idx, p in enumerate(network._network.participants):
-                if p.connected and idx > 0:
-                    if p.ip_address != primary_ip:
-                        print(
-                            f"  [WARN] IP mismatch! Switch B has"
-                            f" {p.ip_address}, Primary expects"
-                            f" {primary_ip}"
-                        )
-                    else:
-                        print(f"  [OK] IP match: {p.ip_address}")
+        match msg:
+            case JoinMsg():
+                print(f"  [REMOTE JOIN] idx={msg.index} IP={msg.ip} MAC={msg.mac}")
+                inject_virtual_participant(
+                    network,
+                    index=msg.index,
+                    ip=msg.ip,
+                    mac_str=msg.mac,
+                    name=bytes.fromhex(msg.name),
+                    app_version=msg.app_version,
+                    platform=msg.platform,
+                )
+            case LeaveMsg():
+                print(f"  [REMOTE LEAVE] idx={msg.index}")
+                remove_virtual_participant(network, msg.index)
+            case AppDataMsg():
+                print(f"  [APP_DATA] updating ({len(msg.data) // 2} bytes)")
+                network.set_application_data(bytes.fromhex(msg.data))
+            case AcceptMsg():
+                print(f"  [ACCEPT] policy={msg.policy}")
+                network.set_accept_policy(msg.policy)
+            case ConnectedMsg():
+                primary_idx = msg.index
+                primary_ip = msg.ip
+                print(
+                    f"  [CONNECTED] Primary STA assigned:"
+                    f" idx={primary_idx} IP={primary_ip}"
+                )
+                # Switch B の IP と一致するか確認
+                for idx, p in enumerate(network._network.participants):
+                    if p.connected and idx > 0:
+                        if p.ip_address != primary_ip:
+                            print(
+                                f"  [WARN] IP mismatch! Switch B has"
+                                f" {p.ip_address}, Primary expects"
+                                f" {primary_ip}"
+                            )
+                        else:
+                            print(f"  [OK] IP match: {p.ip_address}")
 
 
 # --- Main flows ---
@@ -901,11 +931,14 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                                 except (trio.ClosedResourceError, trio.EndOfChannel):
                                     print("  Secondary disconnected before READY")
                                     return
-                                if isinstance(ready_msg, ReadyMsg):
-                                    break
-                                print(
-                                    f"  [WARN] Ignoring unexpected message: {ready_msg!r}"
-                                )
+                                match ready_msg:
+                                    case ReadyMsg():
+                                        break
+                                    case _:
+                                        print(
+                                            f"  [WARN] Ignoring unexpected message:"
+                                            f" {ready_msg!r}"
+                                        )
                             print("  Secondary is ready!")
                             print()
 
@@ -963,9 +996,11 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
         # 3. Receive NETWORK
         while True:
             net_msg = await recv_msg(reader)
-            if isinstance(net_msg, NetworkMsg):
-                break
-            print(f"  [WARN] Ignoring unexpected message: {net_msg!r}")
+            match net_msg:
+                case NetworkMsg():
+                    break
+                case _:
+                    print(f"  [WARN] Ignoring unexpected message: {net_msg!r}")
         network_id = net_msg.network_id
         host_p = net_msg.participants[0]
         print(
@@ -973,7 +1008,7 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
             f" game_id={net_msg.local_communication_id:#018x}"
             f" ch={net_msg.channel} network_id={network_id}"
         )
-        print(f"  Host (Switch A): IP={host_p['ip']} MAC={host_p['mac']}")
+        print(f"  Host (Switch A): IP={host_p.ip} MAC={host_p.mac}")
         print()
 
         # 4. Host proxy LDN
@@ -995,7 +1030,7 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
             await send_msg(peer_stream, ReadyMsg())
 
             print(f"  subnet: 169.254.{network_id}.0/24")
-            print(f"  participant 0 (Switch A): {host_p['ip']} {host_p['mac']}")
+            print(f"  participant 0 (Switch A): {host_p.ip} {host_p.mac}")
             print()
             print("=== Ready ===")
             print("Switch B で「ローカル通信」から参加してください")
