@@ -29,6 +29,7 @@ v4 MAC スプーフリレーアーキテクチャ:
 
 import argparse
 import dataclasses
+import ipaddress
 import json
 import types
 from contextlib import contextmanager
@@ -570,13 +571,12 @@ def make_network_msg_from_scan(info: ldn.NetworkInfo) -> NetworkMsg:
     scan() が返す NetworkInfo は advertisement frame を解析した結果であり、
     STA 接続せずに全情報を取得できる。
     """
-    # network_id: host の IP (169.254.X.1) から X を抽出
-    host_ip = info.participants[0].ip_address
-    network_id = int(host_ip.split(".")[2])
+    # network_id: host の IP (169.254.X.1) から第3オクテット X を抽出
+    host_ip = ipaddress.IPv4Address(info.participants[0].ip_address)
+    network_id = host_ip.packed[2]
 
-    participants: list[NetworkParticipant] = []
-    for i, p in enumerate(info.participants):
-        participants.append(
+    participants = tuple(
+        [
             NetworkParticipant(
                 index=i,
                 ip=p.ip_address,
@@ -586,11 +586,9 @@ def make_network_msg_from_scan(info: ldn.NetworkInfo) -> NetworkMsg:
                 app_version=p.app_version,
                 platform=p.platform,
             )
-        )
-    # LDNのparticipantスロットは8固定（CreateNetworkParam.max_participants）
-    # see https://github.com/kinnay/NintendoClients/wiki/LDN-Protocol
-    for i in range(len(info.participants), ldn.CreateNetworkParam.max_participants):
-        participants.append(
+            for i, p in enumerate(info.participants)
+        ]
+        + [
             NetworkParticipant(
                 index=i,
                 ip="",
@@ -600,7 +598,13 @@ def make_network_msg_from_scan(info: ldn.NetworkInfo) -> NetworkMsg:
                 app_version=0,
                 platform=0,
             )
-        )
+            # LDNのparticipantスロットは8固定（CreateNetworkParam.max_participants）
+            # see https://github.com/kinnay/NintendoClients/wiki/LDN-Protocol
+            for i in range(
+                len(info.participants), ldn.CreateNetworkParam.max_participants
+            )
+        ]
+    )
 
     return NetworkMsg(
         network_id=network_id,
@@ -616,7 +620,7 @@ def make_network_msg_from_scan(info: ldn.NetworkInfo) -> NetworkMsg:
         application_data=info.application_data.hex(),
         server_random=info.server_random.hex(),
         ssid=info.ssid.hex(),
-        participants=tuple(participants),  # type: ignore[arg-type]
+        participants=participants,  # type: ignore[arg-type]
     )
 
 
@@ -864,8 +868,8 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
         return
 
     host = info.participants[0]
-    host_ip = host.ip_address
-    network_id = int(host_ip.split(".")[2])
+    host_ip = ipaddress.IPv4Address(host.ip_address)
+    network_id = host_ip.packed[2]
     print(
         f"\n  ch={info.channel} proto={info.protocol} ver={info.version}"
         f" app_ver={info.app_version}"
