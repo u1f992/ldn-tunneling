@@ -424,8 +424,12 @@ async def send_msg(stream: trio.SocketStream, msg: dict[str, Any]) -> None:
 
 
 async def recv_msg(reader: LineReader) -> dict[str, Any]:
-    line = await reader.readline()
-    return json.loads(line)
+    while True:
+        line = await reader.readline()
+        msg = json.loads(line)
+        if isinstance(msg, dict):
+            return msg
+        print(f"  [WARN] Ignoring non-object JSON: {msg!r}")
 
 
 # --- Message builders ---
@@ -816,14 +820,17 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                             )
                             print("  NETWORK + CONNECTED sent, waiting for READY...")
 
-                            try:
-                                ready_msg = await recv_msg(reader)
-                            except (trio.ClosedResourceError, trio.EndOfChannel):
-                                print("  Secondary disconnected before READY")
-                                return
-                            assert ready_msg["type"] == "ready", (
-                                f"Expected 'ready', got {ready_msg}"
-                            )
+                            while True:
+                                try:
+                                    ready_msg = await recv_msg(reader)
+                                except (trio.ClosedResourceError, trio.EndOfChannel):
+                                    print("  Secondary disconnected before READY")
+                                    return
+                                if ready_msg["type"] == "ready":
+                                    break
+                                print(
+                                    f"  [WARN] Ignoring unexpected message: {ready_msg!r}"
+                                )
                             print("  Secondary is ready!")
                             print()
 
@@ -879,8 +886,11 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
         print("  Connected!")
 
         # 3. Receive NETWORK
-        net_msg = await recv_msg(reader)
-        assert net_msg["type"] == "network", f"Expected 'network', got {net_msg}"
+        while True:
+            net_msg = await recv_msg(reader)
+            if net_msg["type"] == "network":
+                break
+            print(f"  [WARN] Ignoring unexpected message: {net_msg!r}")
         network_id = net_msg["network_id"]
         host_p = net_msg["participants"][0]
         print(
