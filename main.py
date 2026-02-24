@@ -31,6 +31,8 @@ v4 MAC スプーフリレーアーキテクチャ:
 import argparse
 import json
 import types
+from contextlib import ExitStack, contextmanager
+from typing import Generator
 
 import trio
 import ldn
@@ -41,7 +43,15 @@ from pyroute2.netlink.rtnl import TC_H_ROOT
 
 # --- Constants ---
 
-CONTROL_PORT = 39571
+DEFAULT_CONTROL_PORT = 39571
+
+IF_LDN = "ldn"
+IF_LDN_MON = "ldn-mon"
+IF_LDN_TAP = "ldn-tap"
+IF_RELAY_STA = "relay-sta"
+IF_RELAY_BR = "relay-br"
+IF_BRIDGE = "br-ldn"
+IF_GRETAP = "gretap1"
 
 
 # --- pyroute2 helpers ---
@@ -62,13 +72,29 @@ def _ifindex(ipr: IPRoute, ifname: str) -> int | None:
     return idx[0] if idx else None
 
 
-def _link_create(ipr: IPRoute, ifname: str, **kwargs) -> int:
-    """インターフェースを作成し、その ifindex を返す。"""
+@contextmanager
+def _link_create(ipr: IPRoute, ifname: str, **kwargs) -> Generator[int, None, None]:
+    """インターフェースを作成し、yield で ifindex を返す。with 離脱時に自動削除。"""
     ipr.link("add", ifname=ifname, **kwargs)
     idx = ipr.link_lookup(ifname=ifname)
     if not idx:
         raise RuntimeError(f"Failed to create interface {ifname!r}")
-    return idx[0]
+    try:
+        yield idx[0]
+    finally:
+        ipr.link("del", index=idx[0])
+
+
+@contextmanager
+def _veth_create(
+    ipr: IPRoute, ifname: str, peer: str
+) -> Generator[tuple[int, int], None, None]:
+    """veth pair を作成し (ifindex, peer_ifindex) を yield する。with 離脱時に自動削除。"""
+    with _link_create(ipr, ifname, kind="veth", peer=peer) as idx:
+        peer_idx = ipr.link_lookup(ifname=peer)
+        if not peer_idx:
+            raise RuntimeError(f"Failed to create peer interface {peer!r}")
+        yield (idx, peer_idx[0])
 
 
 # --- Network infrastructure ---
@@ -77,7 +103,7 @@ def _link_create(ipr: IPRoute, ifname: str, **kwargs) -> int:
 def cleanup_stale_interfaces(ipr: IPRoute):
     """前回の異常終了で残った LDN インターフェースを削除する。"""
     # nl80211 仮想 IF も RTM_DELLINK で削除可能
-    for ifname in ["ldn", "ldn-mon", "ldn-tap", "relay-sta", "br-ldn", "gretap1"]:
+    for ifname in [IF_LDN, IF_LDN_MON, IF_LDN_TAP, IF_RELAY_STA, IF_BRIDGE, IF_GRETAP]:
         idx = _ifindex(ipr, ifname)
         if idx is not None:
             try:
@@ -85,7 +111,7 @@ def cleanup_stale_interfaces(ipr: IPRoute):
             except NetlinkError:
                 pass
     # tc ingress qdisc (ldn が既に削除されていれば不要だが念のため)
-    idx = _ifindex(ipr, "ldn")
+    idx = _ifindex(ipr, IF_LDN)
     if idx is not None:
         try:
             ipr.tc("del", "ingress", index=idx)
@@ -102,44 +128,57 @@ def cleanup_stale_interfaces(ipr: IPRoute):
         pass
 
 
-def setup_tunnel(ipr: IPRoute, local_ip, remote_ip):
-    """GRETAP トンネル + br-ldn ブリッジを構築する。Primary/Secondary 共用。"""
-    # GRETAP tunnel: key 1, nopmtudisc
-    # gre_iflags/gre_oflags=0x2000 = GRE_KEY flag (big-endian)
-    _log_netlink(
-        f"link add gretap1 type gretap local {local_ip} remote {remote_ip} key 1 nopmtudisc"
-    )
-    idx_gretap = _link_create(
-        ipr,
-        "gretap1",
-        kind="gretap",
-        gre_local=local_ip,
-        gre_remote=remote_ip,
-        gre_ikey=1,
-        gre_okey=1,
-        gre_iflags=0x2000,
-        gre_oflags=0x2000,
-        gre_pmtudisc=0,
-    )
-    _log_netlink("link set gretap1 mtu 1500 up")
-    ipr.link("set", index=idx_gretap, mtu=1500, state="up")
+@contextmanager
+def setup_tunnel(
+    ipr: IPRoute, local_ip, remote_ip
+) -> Generator[tuple[int, int], None, None]:
+    """GRETAP トンネル + br-ldn ブリッジを構築し (idx_gretap, idx_br) を yield する。"""
+    with ExitStack() as stack:
+        # GRETAP tunnel: key 1, nopmtudisc
+        # gre_iflags/gre_oflags=0x2000 = GRE_KEY flag (big-endian)
+        _log_netlink(
+            f"link add {IF_GRETAP} type gretap local {local_ip} remote {remote_ip} key 1 nopmtudisc"
+        )
+        idx_gretap = stack.enter_context(
+            _link_create(
+                ipr,
+                IF_GRETAP,
+                kind="gretap",
+                gre_local=local_ip,
+                gre_remote=remote_ip,
+                gre_ikey=1,
+                gre_okey=1,
+                gre_iflags=0x2000,
+                gre_oflags=0x2000,
+                gre_pmtudisc=0,
+            )
+        )
+        _log_netlink(f"link set {IF_GRETAP} mtu 1500 up")
+        ipr.link("set", index=idx_gretap, mtu=1500, state="up")
 
-    # Bridge
-    _log_netlink("link add br-ldn type bridge stp_state 0 forward_delay 0")
-    idx_br = _link_create(
-        ipr, "br-ldn", kind="bridge", br_stp_state=0, br_forward_delay=0
-    )
-    _log_netlink("link set br-ldn up")
-    ipr.link("set", index=idx_br, state="up")
+        # Bridge
+        _log_netlink(f"link add {IF_BRIDGE} type bridge stp_state 0 forward_delay 0")
+        idx_br = stack.enter_context(
+            _link_create(
+                ipr, IF_BRIDGE, kind="bridge", br_stp_state=0, br_forward_delay=0
+            )
+        )
+        _log_netlink(f"link set {IF_BRIDGE} up")
+        ipr.link("set", index=idx_br, state="up")
 
-    _log_netlink("link set gretap1 master br-ldn")
-    ipr.link("set", index=idx_gretap, master=idx_br)
+        _log_netlink(f"link set {IF_GRETAP} master {IF_BRIDGE}")
+        ipr.link("set", index=idx_gretap, master=idx_br)
 
-    _log_netlink("disable_ipv6 br-ldn")
-    _disable_ipv6("br-ldn")
+        _log_netlink(f"disable_ipv6 {IF_BRIDGE}")
+        _disable_ipv6(IF_BRIDGE)
+
+        yield (idx_gretap, idx_br)
 
 
-def setup_station_relay(ipr: IPRoute, ifname="ldn"):
+@contextmanager
+def setup_station_relay(
+    ipr: IPRoute, idx_gretap: int, idx_br: int, ifname=IF_LDN
+) -> Generator[None, None, None]:
     """Primary: station IF と bridge 間の L2 リレーを tc mirred redirect で構成する。
 
     managed-mode WiFi STA は直接 bridge に追加できない (EOPNOTSUPP) ため、
@@ -148,138 +187,122 @@ def setup_station_relay(ipr: IPRoute, ifname="ldn"):
     MAC learning を無効化し、全フレームをフラッディングさせる。
     bridge ポートが 2 つ (relay-br + gretap1) のみなので、
     フレームは到着ポート以外の全ポート (= もう 1 つ) に転送される。ループなし。
+
+    with 離脱時に veth pair と tc ingress qdisc を自動削除。
     """
-    # veth pair 作成 (_link_create は ifname 側の index を返す; peer は同時に作成される)
-    _log_netlink("link add relay-sta type veth peer relay-br")
-    idx_relay_sta = _link_create(ipr, "relay-sta", kind="veth", peer="relay-br")
-    idx_relay_br = _ifindex(ipr, "relay-br")
-    if idx_relay_br is None:
-        raise RuntimeError("Failed to create veth peer relay-br")
+    # veth pair 作成 (peer= 指定時は (idx, peer_idx) のタプルを yield)
+    _log_netlink(f"link add {IF_RELAY_STA} type veth peer {IF_RELAY_BR}")
+    with _veth_create(ipr, IF_RELAY_STA, IF_RELAY_BR) as (
+        idx_relay_sta,
+        idx_relay_br,
+    ):
+        _log_netlink(f"link set {IF_RELAY_STA} up; link set {IF_RELAY_BR} up")
+        ipr.link("set", index=idx_relay_sta, state="up")
+        ipr.link("set", index=idx_relay_br, state="up")
 
-    _log_netlink("link set relay-sta up; link set relay-br up")
-    ipr.link("set", index=idx_relay_sta, state="up")
-    ipr.link("set", index=idx_relay_br, state="up")
+        # relay-br を bridge に追加
+        _log_netlink(f"link set {IF_RELAY_BR} master {IF_BRIDGE}")
+        ipr.link("set", index=idx_relay_br, master=idx_br)
 
-    # relay-br を bridge に追加
-    idx_br = _ifindex(ipr, "br-ldn")
-    if idx_br is None:
-        raise RuntimeError("Interface br-ldn not found")
-    _log_netlink("link set relay-br master br-ldn")
-    ipr.link("set", index=idx_relay_br, master=idx_br)
+        # MAC learning 無効化 — 全フレームをフラッディング
+        _log_netlink(
+            f"brport set {IF_RELAY_BR} learning off; brport set {IF_GRETAP} learning off"
+        )
+        ipr.brport("set", index=idx_relay_br, learning=0)
+        ipr.brport("set", index=idx_gretap, learning=0)
 
-    # MAC learning 無効化 — 全フレームをフラッディング
-    idx_gretap = _ifindex(ipr, "gretap1")
-    if idx_gretap is None:
-        raise RuntimeError("Interface gretap1 not found")
-    _log_netlink("brport set relay-br learning off; brport set gretap1 learning off")
-    ipr.brport("set", index=idx_relay_br, learning=0)
-    ipr.brport("set", index=idx_gretap, learning=0)
+        # tc ingress redirect: station IF → relay-sta
+        idx_ldn = _ifindex(ipr, ifname)
+        if idx_ldn is None:
+            raise RuntimeError(f"Interface {ifname!r} not found")
+        _log_netlink(
+            f"tc add ingress dev {ifname}; tc add-filter u32 mirred redirect → {IF_RELAY_STA}"
+        )
+        ipr.tc("add", "ingress", index=idx_ldn)
+        ipr.tc(
+            "add-filter",
+            "u32",
+            index=idx_ldn,
+            parent=0xFFFF0000,
+            protocol=protocols.ETH_P_ALL,
+            keys=["0x0/0x0+0"],
+            target=TC_H_ROOT,
+            action={
+                "kind": "mirred",
+                "direction": "egress",
+                "action": "redirect",
+                "ifindex": idx_relay_sta,
+            },
+        )
 
-    # tc ingress redirect: station IF → relay-sta
-    idx_ldn = _ifindex(ipr, ifname)
-    if idx_ldn is None:
-        raise RuntimeError(f"Interface {ifname!r} not found")
-    _log_netlink(
-        f"tc add ingress dev {ifname}; tc add-filter u32 mirred redirect → relay-sta"
-    )
-    ipr.tc("add", "ingress", index=idx_ldn)
-    ipr.tc(
-        "add-filter",
-        "u32",
-        index=idx_ldn,
-        parent=0xFFFF0000,
-        protocol=protocols.ETH_P_ALL,
-        keys=["0x0/0x0+0"],
-        target=TC_H_ROOT,
-        action={
-            "kind": "mirred",
-            "direction": "egress",
-            "action": "redirect",
-            "ifindex": idx_relay_sta,
-        },
-    )
+        # tc ingress redirect: relay-sta → station IF
+        _log_netlink(
+            f"tc add ingress dev {IF_RELAY_STA}; tc add-filter u32 mirred redirect → {ifname}"
+        )
+        ipr.tc("add", "ingress", index=idx_relay_sta)
+        ipr.tc(
+            "add-filter",
+            "u32",
+            index=idx_relay_sta,
+            parent=0xFFFF0000,
+            protocol=protocols.ETH_P_ALL,
+            keys=["0x0/0x0+0"],
+            target=TC_H_ROOT,
+            action={
+                "kind": "mirred",
+                "direction": "egress",
+                "action": "redirect",
+                "ifindex": idx_ldn,
+            },
+        )
 
-    # tc ingress redirect: relay-sta → station IF
-    _log_netlink(
-        f"tc add ingress dev relay-sta; tc add-filter u32 mirred redirect → {ifname}"
-    )
-    ipr.tc("add", "ingress", index=idx_relay_sta)
-    ipr.tc(
-        "add-filter",
-        "u32",
-        index=idx_relay_sta,
-        parent=0xFFFF0000,
-        protocol=protocols.ETH_P_ALL,
-        keys=["0x0/0x0+0"],
-        target=TC_H_ROOT,
-        action={
-            "kind": "mirred",
-            "direction": "egress",
-            "action": "redirect",
-            "ifindex": idx_ldn,
-        },
-    )
+        # IPv6 無効化
+        _log_netlink(f"disable_ipv6 {ifname}, {IF_RELAY_STA}, {IF_RELAY_BR}")
+        _disable_ipv6(ifname)
+        _disable_ipv6(IF_RELAY_STA)
+        _disable_ipv6(IF_RELAY_BR)
 
-    # IPv6 無効化
-    _log_netlink(f"disable_ipv6 {ifname}, relay-sta, relay-br")
-    _disable_ipv6(ifname)
-    _disable_ipv6("relay-sta")
-    _disable_ipv6("relay-br")
-
-
-def teardown_tunnel(ipr: IPRoute):
-    """トンネルとリレーを削除する。Primary/Secondary 共用。"""
-    print("Cleaning up...")
-    # tc ingress qdisc
-    idx = _ifindex(ipr, "ldn")
-    if idx is not None:
         try:
-            ipr.tc("del", "ingress", index=idx)
-        except NetlinkError:
-            pass
-    # link del (relay-sta 削除で veth peer も自動削除)
-    for ifname in ["relay-sta", "br-ldn", "gretap1"]:
-        idx = _ifindex(ipr, ifname)
-        if idx is not None:
+            yield
+        finally:
+            # tc ingress qdisc 削除 (IF_LDN は ldn モジュール管理なのでリンク削除はしない)
             try:
-                ipr.link("del", index=idx)
+                ipr.tc("del", "ingress", index=idx_ldn)
             except NetlinkError:
                 pass
 
 
-def add_tap_to_bridge(ipr: IPRoute):
+def add_tap_to_bridge(ipr: IPRoute, idx_gretap: int, idx_br: int):
     """Secondary: TAP を br-ldn に追加する。MAC learning 無効化でフラッディング強制。"""
 
-    idx_tap = _ifindex(ipr, "ldn-tap")
-    idx_br = _ifindex(ipr, "br-ldn")
-    idx_gretap = _ifindex(ipr, "gretap1")
-    idx_mon = _ifindex(ipr, "ldn-mon")
-    if None in (idx_tap, idx_br, idx_gretap, idx_mon):
+    idx_tap = _ifindex(ipr, IF_LDN_TAP)
+    idx_mon = _ifindex(ipr, IF_LDN_MON)
+    if None in (idx_tap, idx_mon):
         missing = [
             n
             for n, i in [
-                ("ldn-tap", idx_tap),
-                ("br-ldn", idx_br),
-                ("gretap1", idx_gretap),
-                ("ldn-mon", idx_mon),
+                (IF_LDN_TAP, idx_tap),
+                (IF_LDN_MON, idx_mon),
             ]
             if i is None
         ]
         raise RuntimeError(f"Interface(s) not found: {', '.join(missing)}")
 
-    _log_netlink("link set ldn-tap master br-ldn")
+    _log_netlink(f"link set {IF_LDN_TAP} master {IF_BRIDGE}")
     ipr.link("set", index=idx_tap, master=idx_br)
 
-    _log_netlink("brport set ldn-tap learning off; brport set gretap1 learning off")
+    _log_netlink(
+        f"brport set {IF_LDN_TAP} learning off; brport set {IF_GRETAP} learning off"
+    )
     ipr.brport("set", index=idx_tap, learning=0)
     ipr.brport("set", index=idx_gretap, learning=0)
 
-    _log_netlink("disable_ipv6 ldn-tap")
-    _disable_ipv6("ldn-tap")
+    _log_netlink(f"disable_ipv6 {IF_LDN_TAP}")
+    _disable_ipv6(IF_LDN_TAP)
 
     # 802.11 フレームは Ethernet より大きい (header 24 + CCMP 8 + SNAP 8 + MIC 8 = +34 bytes)
     # MTU 1500 だと大きい Pia パケットの変換後フレームが EMSGSIZE になる
-    _log_netlink("link set ldn-mon mtu 2304")
+    _log_netlink(f"link set {IF_LDN_MON} mtu 2304")
     ipr.link("set", index=idx_mon, mtu=2304)
 
 
@@ -309,9 +332,9 @@ def patch_secondary_network(ipr: IPRoute, network, net_msg):
     p0.platform = host["platform"]
 
     # 3. TAP IP を .254 に設定
-    idx_tap = _ifindex(ipr, "ldn-tap")
+    idx_tap = _ifindex(ipr, IF_LDN_TAP)
     if idx_tap is None:
-        raise RuntimeError("Interface ldn-tap not found")
+        raise RuntimeError(f"Interface {IF_LDN_TAP} not found")
     ipr.flush_addr(index=idx_tap)
     ipr.addr(
         "add",
@@ -532,7 +555,7 @@ async def scan_ldn(keys, phy):
         networks = await ldn.scan(
             keys=keys,
             phyname=phy,
-            ifname="ldn",
+            ifname=IF_LDN,
             channels=[1, 6, 11],
             dwell_time=0.130,
             protocols=[1, 3],
@@ -772,10 +795,9 @@ async def run_primary(ipr: IPRoute, args):
 
     # 2. GRETAP tunnel + bridge
     print("=== 2. GRETAP tunnel + bridge ===")
-    setup_tunnel(ipr, args.local, args.remote)
-    print()
+    with setup_tunnel(ipr, args.local, args.remote) as (idx_gretap, idx_br):
+        print()
 
-    try:
         # 3. STA 接続 (Switch B 参加前に relay を完成させる)
         print(f"=== 3. Connecting to Switch A as {switch_b_mac} ===")
         param = ldn.ConnectNetworkParam()
@@ -810,70 +832,73 @@ async def run_primary(ipr: IPRoute, args):
 
                     # 4. Relay 構築 (Switch B 参加前に完成)
                     print("=== 4. Setting up relay ===")
-                    setup_station_relay(ipr)
-                    print()
+                    with setup_station_relay(ipr, idx_gretap, idx_br):
+                        print()
 
-                    # 5. Secondary 待機
-                    listeners = await trio.open_tcp_listeners(
-                        CONTROL_PORT, host=args.local
-                    )
-                    try:
-                        print(
-                            f"=== 5. Waiting for secondary on port {CONTROL_PORT} ==="
+                        # 5. Secondary 待機
+                        listeners = await trio.open_tcp_listeners(
+                            args.control_port, host=args.local
                         )
-                        print(f"  Listening on {args.local}:{CONTROL_PORT}")
-
-                        peer_stream = await listeners[0].accept()
-                        reader = LineReader(peer_stream)
-                        print("  Secondary connected!")
-
-                        # 6. NETWORK + CONNECTED 送信
-                        net_msg = make_network_msg_from_scan(info)
-                        await send_msg(peer_stream, net_msg)
-                        await send_msg(
-                            peer_stream,
-                            {
-                                "type": "connected",
-                                "index": sta_index,
-                                "ip": sta_ip,
-                            },
-                        )
-                        print("  NETWORK + CONNECTED sent, waiting for READY...")
-
                         try:
-                            ready_msg = await recv_msg(reader)
-                        except (trio.ClosedResourceError, trio.EndOfChannel):
-                            print("  Secondary disconnected before READY")
-                            return
-                        assert ready_msg["type"] == "ready", (
-                            f"Expected 'ready', got {ready_msg}"
-                        )
-                        print("  Secondary is ready!")
-                        print()
-
-                        print("=== Ready ===")
-                        print("Switch B で「ローカル通信」から参加してください")
-                        print("Pia 通信が透過的にリレーされます")
-                        print("Ctrl+C で終了")
-                        print()
-
-                        # 7. Event loop
-                        async with trio.open_nursery() as nursery:
-                            nursery.start_soon(
-                                handle_primary_events, sta, peer_stream, switch_b_mac
+                            print(
+                                f"=== 5. Waiting for secondary on port {args.control_port} ==="
                             )
+                            print(f"  Listening on {args.local}:{args.control_port}")
 
-                            async def _wait_secondary(
-                                reader=reader,
-                            ):
-                                await handle_peer_messages_primary(reader)
-                                nursery.cancel_scope.cancel()
+                            peer_stream = await listeners[0].accept()
+                            reader = LineReader(peer_stream)
+                            print("  Secondary connected!")
 
-                            nursery.start_soon(_wait_secondary)
+                            # 6. NETWORK + CONNECTED 送信
+                            net_msg = make_network_msg_from_scan(info)
+                            await send_msg(peer_stream, net_msg)
+                            await send_msg(
+                                peer_stream,
+                                {
+                                    "type": "connected",
+                                    "index": sta_index,
+                                    "ip": sta_ip,
+                                },
+                            )
+                            print("  NETWORK + CONNECTED sent, waiting for READY...")
 
-                    finally:
-                        for listener in listeners:
-                            await listener.aclose()
+                            try:
+                                ready_msg = await recv_msg(reader)
+                            except (trio.ClosedResourceError, trio.EndOfChannel):
+                                print("  Secondary disconnected before READY")
+                                return
+                            assert ready_msg["type"] == "ready", (
+                                f"Expected 'ready', got {ready_msg}"
+                            )
+                            print("  Secondary is ready!")
+                            print()
+
+                            print("=== Ready ===")
+                            print("Switch B で「ローカル通信」から参加してください")
+                            print("Pia 通信が透過的にリレーされます")
+                            print("Ctrl+C で終了")
+                            print()
+
+                            # 7. Event loop
+                            async with trio.open_nursery() as nursery:
+                                nursery.start_soon(
+                                    handle_primary_events,
+                                    sta,
+                                    peer_stream,
+                                    switch_b_mac,
+                                )
+
+                                async def _wait_secondary(
+                                    reader=reader,
+                                ):
+                                    await handle_peer_messages_primary(reader)
+                                    nursery.cancel_scope.cancel()
+
+                                nursery.start_soon(_wait_secondary)
+
+                        finally:
+                            for listener in listeners:
+                                await listener.aclose()
 
                     # Event loop 正常終了 → retry 不要
                     break
@@ -884,9 +909,6 @@ async def run_primary(ipr: IPRoute, args):
                     continue
                 raise
 
-    finally:
-        teardown_tunnel(ipr)
-
 
 async def run_secondary(ipr: IPRoute, args):
     keys = ldn.load_keys(args.keys)
@@ -894,13 +916,12 @@ async def run_secondary(ipr: IPRoute, args):
 
     # 1. GRETAP + bridge
     print("=== 1. GRETAP tunnel + bridge ===")
-    setup_tunnel(ipr, args.local, args.remote)
-    print()
+    with setup_tunnel(ipr, args.local, args.remote) as (idx_gretap, idx_br):
+        print()
 
-    try:
         # 2. Connect to primary
-        print(f"=== 2. Connecting to primary at {args.remote}:{CONTROL_PORT} ===")
-        peer_stream = await trio.open_tcp_stream(args.remote, CONTROL_PORT)
+        print(f"=== 2. Connecting to primary at {args.remote}:{args.control_port} ===")
+        peer_stream = await trio.open_tcp_stream(args.remote, args.control_port)
         reader = LineReader(peer_stream)
         print("  Connected!")
 
@@ -926,7 +947,7 @@ async def run_secondary(ipr: IPRoute, args):
             patch_secondary_network(ipr, network, net_msg)
 
             # 6. Bridge TAP
-            add_tap_to_bridge(ipr)
+            add_tap_to_bridge(ipr, idx_gretap, idx_br)
 
             # 7. Signal ready
             await send_msg(peer_stream, {"type": "ready"})
@@ -942,9 +963,6 @@ async def run_secondary(ipr: IPRoute, args):
             async with trio.open_nursery() as nursery:
                 nursery.start_soon(handle_secondary_events, network, peer_stream)
                 nursery.start_soon(handle_peer_messages_secondary, network, reader)
-
-    finally:
-        teardown_tunnel(ipr)
 
 
 async def main():
@@ -972,6 +990,12 @@ async def main():
         required=True,
         help="LDN パスフレーズを格納したバイナリファイルのパス. "
         "参照: https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases",
+    )
+    parser.add_argument(
+        "--control-port",
+        type=int,
+        default=DEFAULT_CONTROL_PORT,
+        help=f"Primary-Secondary 間の制御ポート (default: {DEFAULT_CONTROL_PORT})",
     )
     args = parser.parse_args()
     with open(args.ldn_passphrase, "rb") as f:
