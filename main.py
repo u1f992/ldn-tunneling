@@ -96,6 +96,10 @@ class SecondaryConfig(_BaseConfig):
     pass
 
 
+class InvalidMessageError(Exception):
+    """制御チャネルで受信したメッセージがデコードできなかった。"""
+
+
 # --- Control messages ---
 
 
@@ -127,17 +131,6 @@ class NetworkMsg:
     server_random: str
     ssid: str
     participants: list[NetworkParticipant]
-
-    def __post_init__(self) -> None:
-        # _decode_msg 経由では participants が list[dict] で渡される
-        object.__setattr__(
-            self,
-            "participants",
-            [
-                NetworkParticipant(**p) if isinstance(p, dict) else p
-                for p in self.participants
-            ],
-        )
 
 
 @dataclass(frozen=True)
@@ -206,8 +199,13 @@ def _decode_msg(d: dict[str, Any]) -> ControlMsg:
     tag = d.pop("type")
     cls = _MSG_REGISTRY.get(tag)
     if cls is None:
-        raise ValueError(f"Unknown message type: {tag!r}")
-    return cls(**d)
+        raise InvalidMessageError(f"Unknown message type: {tag!r}")
+    try:
+        if cls is NetworkMsg:
+            d["participants"] = [NetworkParticipant(**p) for p in d["participants"]]
+        return cls(**d)
+    except Exception as e:
+        raise InvalidMessageError(f"Malformed {tag!r} message: {e}") from e
 
 
 # --- pyroute2 helpers ---
@@ -538,13 +536,11 @@ async def send_msg(stream: trio.SocketStream, msg: ControlMsg) -> None:
 
 
 async def recv_msg(reader: LineReader) -> ControlMsg:
-    while True:
-        line = await reader.readline()
-        raw = json.loads(line)
-        if not isinstance(raw, dict):
-            print(f"  [WARN] Ignoring non-object JSON: {raw!r}")
-            continue
-        return _decode_msg(raw)
+    line = await reader.readline()
+    raw = json.loads(line)
+    if not isinstance(raw, dict):
+        raise InvalidMessageError(f"Non-object JSON: {raw!r}")
+    return _decode_msg(raw)
 
 
 # --- Message builders ---
@@ -765,6 +761,9 @@ async def handle_peer_messages_primary(reader: LineReader) -> None:
         except (trio.ClosedResourceError, trio.EndOfChannel):
             print("  [CTRL] Secondary disconnected")
             break
+        except InvalidMessageError as e:
+            print(f"  [WARN] {e}")
+            continue
 
         match msg:
             case LeaveMsg():
@@ -788,6 +787,9 @@ async def handle_peer_messages_secondary(
         except (trio.ClosedResourceError, trio.EndOfChannel):
             print("  [CTRL] Primary disconnected")
             break
+        except InvalidMessageError as e:
+            print(f"  [WARN] {e}")
+            continue
 
         match msg:
             case JoinMsg():
@@ -931,6 +933,9 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                                 except (trio.ClosedResourceError, trio.EndOfChannel):
                                     print("  Secondary disconnected before READY")
                                     return
+                                except InvalidMessageError as e:
+                                    print(f"  [WARN] {e}")
+                                    continue
                                 match ready_msg:
                                     case ReadyMsg():
                                         break
@@ -995,7 +1000,11 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
 
         # 3. Receive NETWORK
         while True:
-            net_msg = await recv_msg(reader)
+            try:
+                net_msg = await recv_msg(reader)
+            except InvalidMessageError as e:
+                print(f"  [WARN] {e}")
+                continue
             match net_msg:
                 case NetworkMsg():
                     break
