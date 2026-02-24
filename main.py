@@ -37,6 +37,7 @@ import argparse
 import dataclasses
 import ipaddress
 import json
+import logging
 import types
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -46,6 +47,8 @@ import trio
 import ldn
 from pyroute2 import IPRoute, protocols
 from pyroute2.netlink.rtnl import TC_H_ROOT
+
+logger = logging.getLogger(__name__)
 
 
 # --- Constants ---
@@ -477,7 +480,7 @@ def patch_secondary_network(
                 break
 
         if target_index is None:
-            print("  [WARN] No free participant slot (index 1-7)")
+            logger.warning("No free participant slot (index 1-7)")
             return
 
         self._peers.append(address)
@@ -686,7 +689,6 @@ def make_leave_msg(index: int) -> LeaveMsg:
 
 async def scan_ldn(keys: dict[str, bytes], phy: str) -> ldn.NetworkInfo | None:
     for attempt in range(10):
-        print(f"Scan {attempt + 1}/10...", end=" ", flush=True)
         networks = await ldn.scan(
             keys=keys,
             phyname=phy,
@@ -695,7 +697,7 @@ async def scan_ldn(keys: dict[str, bytes], phy: str) -> ldn.NetworkInfo | None:
             dwell_time=0.130,
             protocols=[1, 3],
         )
-        print(f"{len(networks)} found")
+        logger.info("Scan %d/10: %d found", attempt + 1, len(networks))
         if networks:
             return networks[0]
     return None
@@ -720,31 +722,29 @@ async def handle_primary_events(
                     p = event.participant
                     # Skip our own join event
                     if str(p.mac_address) == relay_mac:
-                        print(
-                            f"  [PRIMARY JOIN] idx={event.index} (self, skipping relay)"
-                        )
+                        logger.info("PRIMARY JOIN idx=%d (self, skipping relay)", event.index)
                         continue
-                    print(
-                        f"  [PRIMARY JOIN] idx={event.index}"
-                        f" {p.name.decode(errors='replace')}"
-                        f" IP={p.ip_address} MAC={p.mac_address}"
+                    logger.info(
+                        "PRIMARY JOIN idx=%d %s IP=%s MAC=%s",
+                        event.index, p.name.decode(errors="replace"),
+                        p.ip_address, p.mac_address,
                     )
                     await send_msg(peer_stream, make_join_msg(event.index, p))
                 case ldn.LeaveEvent():
                     p = event.participant
-                    print(
-                        f"  [PRIMARY LEAVE] idx={event.index}"
-                        f" {p.name.decode(errors='replace')}"
+                    logger.info(
+                        "PRIMARY LEAVE idx=%d %s",
+                        event.index, p.name.decode(errors="replace"),
                     )
                     await send_msg(peer_stream, make_leave_msg(event.index))
                 case ldn.ApplicationDataChanged():
-                    print(f"  [APP_DATA] {len(event.new)} bytes")
+                    logger.info("APP_DATA %d bytes", len(event.new))
                     await send_msg(peer_stream, AppDataMsg(data=event.new.hex()))
                 case ldn.AcceptPolicyChanged():
-                    print(f"  [ACCEPT] {event.old} -> {event.new}")
+                    logger.info("ACCEPT %d -> %d", event.old, event.new)
                     await send_msg(peer_stream, AcceptMsg(policy=event.new))
                 case ldn.DisconnectEvent():
-                    print(f"  [DISCONNECT] reason={event.reason}")
+                    logger.info("DISCONNECT reason=%s", event.reason)
                     break
     except (trio.ClosedResourceError, trio.BrokenResourceError):
         pass
@@ -762,17 +762,17 @@ async def handle_secondary_events(
         match event:
             case ldn.JoinEvent():
                 p = event.participant
-                print(
-                    f"  [SECONDARY JOIN] idx={event.index}"
-                    f" {p.name.decode(errors='replace')}"
-                    f" IP={p.ip_address} MAC={p.mac_address}"
+                logger.info(
+                    "SECONDARY JOIN idx=%d %s IP=%s MAC=%s",
+                    event.index, p.name.decode(errors="replace"),
+                    p.ip_address, p.mac_address,
                 )
                 await send_msg(peer_stream, make_join_msg(event.index, p))
             case ldn.LeaveEvent():
                 p = event.participant
-                print(
-                    f"  [SECONDARY LEAVE] idx={event.index}"
-                    f" {p.name.decode(errors='replace')}"
+                logger.info(
+                    "SECONDARY LEAVE idx=%d %s",
+                    event.index, p.name.decode(errors="replace"),
                 )
                 await send_msg(peer_stream, make_leave_msg(event.index))
 
@@ -787,21 +787,20 @@ async def handle_peer_messages_primary(reader: LineReader) -> None:
         try:
             msg = await recv_msg(reader)
         except (trio.ClosedResourceError, trio.EndOfChannel):
-            print("  [CTRL] Secondary disconnected")
+            logger.info("Secondary disconnected")
             break
         except InvalidMessageError as e:
-            print(f"  [WARN] {e}")
+            logger.warning("%s", e)
             continue
 
         match msg:
             case LeaveMsg():
-                print(f"  [REMOTE LEAVE] idx={msg.index} (continuing relay)")
+                logger.info("REMOTE LEAVE idx=%d (continuing relay)", msg.index)
             case JoinMsg():
                 # Additional participants (future support)
-                print(
-                    f"  [REMOTE JOIN] idx={msg.index}"
-                    f" IP={msg.ip} MAC={msg.mac}"
-                    f" (additional participant, not yet supported)"
+                logger.info(
+                    "REMOTE JOIN idx=%d IP=%s MAC=%s (additional participant, not yet supported)",
+                    msg.index, msg.ip, msg.mac,
                 )
 
 
@@ -813,15 +812,15 @@ async def handle_peer_messages_secondary(
         try:
             msg = await recv_msg(reader)
         except (trio.ClosedResourceError, trio.EndOfChannel):
-            print("  [CTRL] Primary disconnected")
+            logger.info("Primary disconnected")
             break
         except InvalidMessageError as e:
-            print(f"  [WARN] {e}")
+            logger.warning("%s", e)
             continue
 
         match msg:
             case JoinMsg():
-                print(f"  [REMOTE JOIN] idx={msg.index} IP={msg.ip} MAC={msg.mac}")
+                logger.info("REMOTE JOIN idx=%d IP=%s MAC=%s", msg.index, msg.ip, msg.mac)
                 inject_virtual_participant(
                     network,
                     index=msg.index,
@@ -832,32 +831,29 @@ async def handle_peer_messages_secondary(
                     platform=msg.platform,
                 )
             case LeaveMsg():
-                print(f"  [REMOTE LEAVE] idx={msg.index}")
+                logger.info("REMOTE LEAVE idx=%d", msg.index)
                 remove_virtual_participant(network, msg.index)
             case AppDataMsg():
-                print(f"  [APP_DATA] updating ({len(msg.data) // 2} bytes)")
+                logger.info("APP_DATA updating (%d bytes)", len(msg.data) // 2)
                 network.set_application_data(bytes.fromhex(msg.data))
             case AcceptMsg():
-                print(f"  [ACCEPT] policy={msg.policy}")
+                logger.info("ACCEPT policy=%d", msg.policy)
                 network.set_accept_policy(msg.policy)
             case ConnectedMsg():
-                primary_idx = msg.index
-                primary_ip = msg.ip
-                print(
-                    f"  [CONNECTED] Primary STA assigned:"
-                    f" idx={primary_idx} IP={primary_ip}"
+                logger.info(
+                    "CONNECTED Primary STA assigned: idx=%d IP=%s",
+                    msg.index, msg.ip,
                 )
                 # Verify that the IP matches Switch B's
                 for idx, p in enumerate(network._network.participants):
                     if p.connected and idx > 0:
-                        if p.ip_address != primary_ip:
-                            print(
-                                f"  [WARN] IP mismatch! Switch B has"
-                                f" {p.ip_address}, Primary expects"
-                                f" {primary_ip}"
+                        if p.ip_address != msg.ip:
+                            logger.warning(
+                                "IP mismatch: Switch B has %s, Primary expects %s",
+                                p.ip_address, msg.ip,
                             )
                         else:
-                            print(f"  [OK] IP match: {p.ip_address}")
+                            logger.info("IP match: %s", p.ip_address)
 
 
 # --- Main flows ---
@@ -865,30 +861,25 @@ async def handle_peer_messages_secondary(
 
 async def run_primary(ipr: IPRoute, config: PrimaryConfig):
     # 1. Scan (no STA association; all info is obtained from the scan result)
-    print("=== 1. Scan for LDN network ===")
-    print("Create a local-communication room on Switch A")
-    print()
+    logger.info("Scanning for LDN network (create a local-communication room on Switch A)")
     info = await scan_ldn(config.keys, config.phy)
     if info is None:
-        print("LDN network not found.")
+        logger.error("LDN network not found")
         return
 
     host = info.participants[0]
-    print(
-        f"\n  ch={info.channel} proto={info.protocol} ver={info.version}"
-        f" app_ver={info.app_version}"
+    logger.info(
+        "Found network: ch=%d proto=%d ver=%d app_ver=%d BSSID=%s host_ip=%s host_mac=%s",
+        info.channel, info.protocol, info.version, info.app_version,
+        info.address, host.ip_address, host.mac_address,
     )
-    print(f"  BSSID={info.address}")
-    print(f"  Host: IP={host.ip_address} MAC={host.mac_address}")
-    print()
 
     # 2. GRETAP tunnel + bridge
-    print("=== 2. GRETAP tunnel + bridge ===")
+    logger.info("Setting up GRETAP tunnel + bridge")
     with setup_tunnel(ipr, config.local, config.remote) as (idx_gretap, idx_br):
-        print()
 
         # 3. STA connect (complete the relay before Switch B joins)
-        print(f"=== 3. Connecting to Switch A as {config.switch_b_mac} ===")
+        logger.info("Connecting to Switch A as %s", config.switch_b_mac)
         param = ldn.ConnectNetworkParam(
             keys=config.keys,
             phyname=config.phy,
@@ -901,13 +892,12 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
         max_connect_attempts = 3
         for attempt in range(max_connect_attempts):
             if attempt > 0:
-                print(f"\n  Retry {attempt + 1}/{max_connect_attempts} in 2 seconds...")
+                logger.info("Retry %d/%d in 2 seconds", attempt + 1, max_connect_attempts)
                 await trio.sleep(2)
-                # Re-scan for fresh NetworkInfo
-                print("  Re-scanning...")
+                logger.info("Re-scanning...")
                 fresh_info = await scan_ldn(config.keys, config.phy)
                 if fresh_info is None:
-                    print("  Network not found!")
+                    logger.warning("Network not found on re-scan")
                     continue
                 info = fresh_info
                 param.network = info
@@ -916,33 +906,30 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                 async with ldn.connect(param) as sta:
                     sta_index = sta._participant_id
                     sta_ip = sta.participant().ip_address
-                    print(f"  Connected (participant {sta_index})")
-                    print(f"  IP: {sta_ip}")
-                    print(f"  MAC: {config.switch_b_mac} (spoofed)")
-                    print()
+                    logger.info(
+                        "Connected: participant=%d IP=%s MAC=%s (spoofed)",
+                        sta_index, sta_ip, config.switch_b_mac,
+                    )
 
                     # 4. Relay setup (completed before Switch B joins)
-                    print("=== 4. Setting up relay ===")
+                    logger.info("Setting up station relay")
                     with setup_station_relay(
                         ipr, idx_gretap, idx_br, sta.ifindex, IF_LDN
                     ):
-                        print()
 
                         # 5. Wait for Secondary
                         listeners = await trio.open_tcp_listeners(
                             config.control_port, host=config.local
                         )
                         try:
-                            print(
-                                f"=== 5. Waiting for secondary on port {config.control_port} ==="
-                            )
-                            print(
-                                f"  Listening on {config.local}:{config.control_port}"
+                            logger.info(
+                                "Waiting for secondary on %s:%d",
+                                config.local, config.control_port,
                             )
 
                             peer_stream = await listeners[0].accept()
                             reader = LineReader(peer_stream)
-                            print("  Secondary connected!")
+                            logger.info("Secondary connected")
 
                             # 6. Send NETWORK + CONNECTED
                             net_msg = make_network_msg_from_scan(info)
@@ -951,33 +938,27 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                                 peer_stream,
                                 ConnectedMsg(index=sta_index, ip=sta_ip),
                             )
-                            print("  NETWORK + CONNECTED sent, waiting for READY...")
+                            logger.info("NETWORK + CONNECTED sent, waiting for READY")
 
                             while True:
                                 try:
                                     ready_msg = await recv_msg(reader)
                                 except (trio.ClosedResourceError, trio.EndOfChannel):
-                                    print("  Secondary disconnected before READY")
+                                    logger.error("Secondary disconnected before READY")
                                     return
                                 except InvalidMessageError as e:
-                                    print(f"  [WARN] {e}")
+                                    logger.warning("%s", e)
                                     continue
                                 match ready_msg:
                                     case ReadyMsg():
                                         break
                                     case _:
-                                        print(
-                                            f"  [WARN] Ignoring unexpected message:"
-                                            f" {ready_msg!r}"
+                                        logger.warning(
+                                            "Ignoring unexpected message: %r",
+                                            ready_msg,
                                         )
-                            print("  Secondary is ready!")
-                            print()
-
-                            print("=== Ready ===")
-                            print("Join via local communication on Switch B")
-                            print("Pia traffic will be transparently relayed")
-                            print("Ctrl+C to exit")
-                            print()
+                            logger.info("Secondary is ready")
+                            logger.info("Join via local communication on Switch B (Ctrl+C to exit)")
 
                             # 7. Event loop
                             async with trio.open_nursery() as nursery:
@@ -1003,51 +984,46 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                     # Event loop exited normally; no retry needed
                     break
             except ConnectionError as e:
-                print(f"  Connect failed: {e}")
+                logger.error("Connect failed: %s", e)
                 if attempt < max_connect_attempts - 1:
-                    print("  Will retry...")
+                    logger.info("Will retry...")
                     continue
                 raise
 
 
 async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
     # 1. GRETAP + bridge
-    print("=== 1. GRETAP tunnel + bridge ===")
+    logger.info("Setting up GRETAP tunnel + bridge")
     with setup_tunnel(ipr, config.local, config.remote) as (idx_gretap, idx_br):
-        print()
 
         # 2. Connect to primary
-        print(
-            f"=== 2. Connecting to primary at {config.remote}:{config.control_port} ==="
-        )
+        logger.info("Connecting to primary at %s:%d", config.remote, config.control_port)
         peer_stream = await trio.open_tcp_stream(config.remote, config.control_port)
         reader = LineReader(peer_stream)
-        print("  Connected!")
+        logger.info("Connected to primary")
 
         # 3. Receive NETWORK
         while True:
             try:
                 net_msg = await recv_msg(reader)
             except InvalidMessageError as e:
-                print(f"  [WARN] {e}")
+                logger.warning("%s", e)
                 continue
             match net_msg:
                 case NetworkMsg():
                     break
                 case _:
-                    print(f"  [WARN] Ignoring unexpected message: {net_msg!r}")
+                    logger.warning("Ignoring unexpected message: %r", net_msg)
         network_id = net_msg.network_id
         host_p = net_msg.participants[0]
-        print(
-            f"  Received NETWORK:"
-            f" game_id={net_msg.local_communication_id:#018x}"
-            f" ch={net_msg.channel} network_id={network_id}"
+        logger.info(
+            "Received NETWORK: game_id=%#018x ch=%d network_id=%d host_ip=%s host_mac=%s",
+            net_msg.local_communication_id, net_msg.channel,
+            network_id, host_p.ip, host_p.mac,
         )
-        print(f"  Host (Switch A): IP={host_p.ip} MAC={host_p.mac}")
-        print()
 
         # 4. Host proxy LDN
-        print("=== 3. Hosting proxy LDN network ===")
+        logger.info("Hosting proxy LDN network")
         param = make_create_param(
             config.keys, config.phy, net_msg, config.ldn_passphrase or b""
         )
@@ -1064,13 +1040,10 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
             # 7. Signal ready
             await send_msg(peer_stream, ReadyMsg())
 
-            print(f"  subnet: 169.254.{network_id}.0/24")
-            print(f"  participant 0 (Switch A): {host_p.ip} {host_p.mac}")
-            print()
-            print("=== Ready ===")
-            print("Join via local communication on Switch B")
-            print("Ctrl+C to exit")
-            print()
+            logger.info(
+                "Ready: subnet=169.254.%d.0/24 participant_0=%s/%s (Ctrl+C to exit)",
+                network_id, host_p.ip, host_p.mac,
+            )
 
             async with trio.open_nursery() as nursery:
                 nursery.start_soon(handle_secondary_events, network, peer_stream)
@@ -1121,6 +1094,8 @@ async def main():
         remote=args.remote,
         control_port=args.control_port,
     )
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     with IPRoute() as ipr:
         cleanup_stale_interfaces(ipr)
