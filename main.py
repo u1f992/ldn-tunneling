@@ -38,6 +38,8 @@ import dataclasses
 import ipaddress
 import json
 import logging
+import socket
+import struct
 import types
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -48,6 +50,8 @@ import ldn
 from pyroute2 import IPRoute, protocols
 from pyroute2.netlink.rtnl import TC_H_ROOT
 
+TRACE = 5
+logging.addLevelName(TRACE, "TRACE")
 logger = logging.getLogger(__name__)
 
 
@@ -856,6 +860,53 @@ async def handle_peer_messages_secondary(
                             logger.info("IP match: %s", p.ip_address)
 
 
+# --- Packet trace (TRACE level) ---
+
+_TRACE_INTERFACES = (
+    IF_LDN, IF_LDN_MON, IF_LDN_TAP,
+    IF_RELAY_STA, IF_RELAY_BR,
+    IF_BRIDGE, IF_GRETAP,
+)
+
+ETH_P_ALL = 0x0003
+
+
+def _format_mac(b: bytes) -> str:
+    return ":".join(f"{x:02x}" for x in b)
+
+
+async def _capture_packets(ifname: str) -> None:
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+    try:
+        sock.bind((ifname, 0))
+        sock.setblocking(False)
+        while True:
+            await trio.lowlevel.wait_readable(sock)
+            data = sock.recv(65535)
+            if len(data) < 14:
+                continue
+            dst = _format_mac(data[0:6])
+            src = _format_mac(data[6:12])
+            ethertype = struct.unpack("!H", data[12:14])[0]
+            logger.log(
+                TRACE,
+                "%s %s > %s ethertype=0x%04x len=%d",
+                ifname, src, dst, ethertype, len(data),
+            )
+    except OSError:
+        pass
+    finally:
+        sock.close()
+
+
+def _start_packet_trace(nursery: trio.Nursery, ipr: IPRoute) -> None:
+    if not logger.isEnabledFor(TRACE):
+        return
+    for ifname in _TRACE_INTERFACES:
+        if _ifindex(ipr, ifname) is not None:
+            nursery.start_soon(_capture_packets, ifname)
+
+
 # --- Main flows ---
 
 
@@ -962,6 +1013,7 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
 
                             # 7. Event loop
                             async with trio.open_nursery() as nursery:
+                                _start_packet_trace(nursery, ipr)
                                 nursery.start_soon(
                                     handle_primary_events,
                                     sta,
@@ -1046,6 +1098,7 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
             )
 
             async with trio.open_nursery() as nursery:
+                _start_packet_trace(nursery, ipr)
                 nursery.start_soon(handle_secondary_events, network, peer_stream)
                 nursery.start_soon(handle_peer_messages_secondary, network, reader)
 
@@ -1082,7 +1135,7 @@ async def main():
     parser.add_argument(
         "--log-level",
         default="info",
-        choices=["debug", "info", "warning", "error", "critical"],
+        choices=["trace", "debug", "info", "warning", "error", "critical"],
         help="Logging verbosity (default: info)",
     )
     args = parser.parse_args()
@@ -1101,10 +1154,8 @@ async def main():
         control_port=args.control_port,
     )
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper()),
-        format="%(levelname)s: %(message)s",
-    )
+    level = TRACE if args.log_level == "trace" else getattr(logging, args.log_level.upper())
+    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
 
     with IPRoute() as ipr:
         cleanup_stale_interfaces(ipr)
