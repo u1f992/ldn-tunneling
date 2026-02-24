@@ -28,11 +28,12 @@ v4 MAC スプーフリレーアーキテクチャ:
 """
 
 import argparse
+import dataclasses
 import json
 import types
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Generator
+from typing import Any, ClassVar, Generator
 
 import trio
 import ldn
@@ -93,6 +94,98 @@ class PrimaryConfig(_BaseConfig):
 @dataclass(frozen=True)
 class SecondaryConfig(_BaseConfig):
     pass
+
+
+# --- Control messages ---
+
+
+@dataclass(frozen=True)
+class NetworkMsg:
+    _tag: ClassVar[str] = "network"
+    network_id: int
+    local_communication_id: int
+    scene_id: int
+    channel: int
+    protocol: int
+    version: int
+    app_version: int
+    max_participants: int
+    security_mode: int
+    accept_policy: int
+    application_data: str
+    server_random: str
+    ssid: str
+    participants: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ConnectedMsg:
+    _tag: ClassVar[str] = "connected"
+    index: int
+    ip: str
+
+
+@dataclass(frozen=True)
+class ReadyMsg:
+    _tag: ClassVar[str] = "ready"
+
+
+@dataclass(frozen=True)
+class JoinMsg:
+    _tag: ClassVar[str] = "join"
+    index: int
+    ip: str
+    mac: str
+    name: str
+    app_version: int
+    platform: int
+
+
+@dataclass(frozen=True)
+class LeaveMsg:
+    _tag: ClassVar[str] = "leave"
+    index: int
+
+
+@dataclass(frozen=True)
+class AppDataMsg:
+    _tag: ClassVar[str] = "app_data"
+    data: str
+
+
+@dataclass(frozen=True)
+class AcceptMsg:
+    _tag: ClassVar[str] = "accept"
+    policy: int
+
+
+ControlMsg = (
+    NetworkMsg | ConnectedMsg | ReadyMsg | JoinMsg | LeaveMsg | AppDataMsg | AcceptMsg
+)
+
+_MSG_REGISTRY: dict[str, type] = {
+    "network": NetworkMsg,
+    "connected": ConnectedMsg,
+    "ready": ReadyMsg,
+    "join": JoinMsg,
+    "leave": LeaveMsg,
+    "app_data": AppDataMsg,
+    "accept": AcceptMsg,
+}
+
+
+def _encode_msg(msg: ControlMsg) -> bytes:
+    d = dataclasses.asdict(msg)
+    d["type"] = msg._tag
+    return json.dumps(d).encode() + b"\n"
+
+
+def _decode_msg(d: dict[str, Any]) -> ControlMsg:
+    tag = d.pop("type")
+    cls = _MSG_REGISTRY.get(tag)
+    if cls is None:
+        raise ValueError(f"Unknown message type: {tag!r}")
+    return cls(**d)
 
 
 # --- pyroute2 helpers ---
@@ -297,7 +390,7 @@ def add_tap_to_bridge(
 
 
 def patch_secondary_network(
-    ipr: IPRoute, network: ldn.APNetwork, net_msg: dict[str, Any], idx_tap: int
+    ipr: IPRoute, network: ldn.APNetwork, net_msg: NetworkMsg, idx_tap: int
 ):
     """Secondary の APNetwork を Switch A のプロキシとしてパッチする。
 
@@ -306,8 +399,8 @@ def patch_secondary_network(
     3. TAP IP を .254 に設定 — Switch A の IP (.1) を横取りしない
     4. _register_participant を index 1+ に制限 — index 0=Switch A
     """
-    network_id = net_msg["network_id"]
-    host = net_msg["participants"][0]
+    network_id = net_msg.network_id
+    host = net_msg.participants[0]
 
     # 1. _network_id 統一
     network._network_id = network_id
@@ -418,25 +511,25 @@ class LineReader:
         return line
 
 
-async def send_msg(stream: trio.SocketStream, msg: dict[str, Any]) -> None:
-    data = json.dumps(msg).encode() + b"\n"
-    await stream.send_all(data)
+async def send_msg(stream: trio.SocketStream, msg: ControlMsg) -> None:
+    await stream.send_all(_encode_msg(msg))
 
 
-async def recv_msg(reader: LineReader) -> dict[str, Any]:
+async def recv_msg(reader: LineReader) -> ControlMsg:
     while True:
         line = await reader.readline()
-        msg = json.loads(line)
-        if isinstance(msg, dict):
-            return msg
-        print(f"  [WARN] Ignoring non-object JSON: {msg!r}")
+        raw = json.loads(line)
+        if not isinstance(raw, dict):
+            print(f"  [WARN] Ignoring non-object JSON: {raw!r}")
+            continue
+        return _decode_msg(raw)
 
 
 # --- Message builders ---
 
 
-def make_network_msg_from_scan(info: ldn.NetworkInfo) -> dict[str, Any]:
-    """scan 結果の NetworkInfo を NETWORK メッセージに変換する。
+def make_network_msg_from_scan(info: ldn.NetworkInfo) -> NetworkMsg:
+    """scan 結果の NetworkInfo を NetworkMsg に変換する。
 
     scan() が返す NetworkInfo は advertisement frame を解析した結果であり、
     STA 接続せずに全情報を取得できる。
@@ -472,23 +565,22 @@ def make_network_msg_from_scan(info: ldn.NetworkInfo) -> dict[str, Any]:
             }
         )
 
-    return {
-        "type": "network",
-        "network_id": network_id,
-        "local_communication_id": info.local_communication_id,
-        "scene_id": info.scene_id,
-        "channel": info.channel,
-        "protocol": info.protocol,
-        "version": info.version,
-        "app_version": info.app_version,
-        "max_participants": info.max_participants,
-        "security_mode": info.security_mode,
-        "accept_policy": info.accept_policy,
-        "application_data": info.application_data.hex(),
-        "server_random": info.server_random.hex(),
-        "ssid": info.ssid.hex(),
-        "participants": participants,
-    }
+    return NetworkMsg(
+        network_id=network_id,
+        local_communication_id=info.local_communication_id,
+        scene_id=info.scene_id,
+        channel=info.channel,
+        protocol=info.protocol,
+        version=info.version,
+        app_version=info.app_version,
+        max_participants=info.max_participants,
+        security_mode=info.security_mode,
+        accept_policy=info.accept_policy,
+        application_data=info.application_data.hex(),
+        server_random=info.server_random.hex(),
+        ssid=info.ssid.hex(),
+        participants=participants,
+    )
 
 
 def pick_secondary_channel(primary_channel: int) -> int:
@@ -503,44 +595,43 @@ def pick_secondary_channel(primary_channel: int) -> int:
 
 
 def make_create_param(
-    keys: dict[str, bytes], phy: str, msg: dict[str, Any], passphrase: bytes
+    keys: dict[str, bytes], phy: str, msg: NetworkMsg, passphrase: bytes
 ) -> ldn.CreateNetworkParam:
-    """NETWORK メッセージから CreateNetworkParam を構築する。"""
+    """NetworkMsg から CreateNetworkParam を構築する。"""
     return ldn.CreateNetworkParam(
         keys=keys,
         phyname=phy,
         phyname_monitor=phy,
-        local_communication_id=msg["local_communication_id"],
-        scene_id=msg["scene_id"],
-        channel=pick_secondary_channel(msg["channel"]),
-        protocol=msg["protocol"],
-        version=msg["version"],
-        app_version=msg["app_version"],
-        max_participants=msg["max_participants"],
-        security_mode=msg["security_mode"],
-        accept_policy=msg["accept_policy"],
-        application_data=bytes.fromhex(msg["application_data"]),
-        server_random=bytes.fromhex(msg["server_random"]),
-        ssid=bytes.fromhex(msg["ssid"]),
+        local_communication_id=msg.local_communication_id,
+        scene_id=msg.scene_id,
+        channel=pick_secondary_channel(msg.channel),
+        protocol=msg.protocol,
+        version=msg.version,
+        app_version=msg.app_version,
+        max_participants=msg.max_participants,
+        security_mode=msg.security_mode,
+        accept_policy=msg.accept_policy,
+        application_data=bytes.fromhex(msg.application_data),
+        server_random=bytes.fromhex(msg.server_random),
+        ssid=bytes.fromhex(msg.ssid),
         password=passphrase,
         name=b"LDN-Tunnel",
     )
 
 
-def make_join_msg(index: int, participant: ldn.ParticipantInfo) -> dict[str, Any]:
-    return {
-        "type": "join",
-        "index": index,
-        "ip": participant.ip_address,
-        "mac": str(participant.mac_address),
-        "name": participant.name.hex(),
-        "app_version": participant.app_version,
-        "platform": participant.platform,
-    }
+def make_join_msg(index: int, participant: ldn.ParticipantInfo) -> JoinMsg:
+    return JoinMsg(
+        index=index,
+        ip=participant.ip_address,
+        mac=str(participant.mac_address),
+        name=participant.name.hex(),
+        app_version=participant.app_version,
+        platform=participant.platform,
+    )
 
 
-def make_leave_msg(index: int) -> dict[str, Any]:
-    return {"type": "leave", "index": index}
+def make_leave_msg(index: int) -> LeaveMsg:
+    return LeaveMsg(index=index)
 
 
 # --- LDN scan ---
@@ -598,22 +689,10 @@ async def handle_primary_events(
                 await send_msg(peer_stream, make_leave_msg(event.index))
             elif isinstance(event, ldn.ApplicationDataChanged):
                 print(f"  [APP_DATA] {len(event.new)} bytes")
-                await send_msg(
-                    peer_stream,
-                    {
-                        "type": "app_data",
-                        "data": event.new.hex(),
-                    },
-                )
+                await send_msg(peer_stream, AppDataMsg(data=event.new.hex()))
             elif isinstance(event, ldn.AcceptPolicyChanged):
                 print(f"  [ACCEPT] {event.old} -> {event.new}")
-                await send_msg(
-                    peer_stream,
-                    {
-                        "type": "accept",
-                        "policy": event.new,
-                    },
-                )
+                await send_msg(peer_stream, AcceptMsg(policy=event.new))
             elif isinstance(event, ldn.DisconnectEvent):
                 print(f"  [DISCONNECT] reason={event.reason}")
                 break
@@ -660,13 +739,13 @@ async def handle_peer_messages_primary(reader: LineReader) -> None:
             print("  [CTRL] Secondary disconnected")
             break
 
-        if msg["type"] == "leave":
-            print(f"  [REMOTE LEAVE] idx={msg['index']} (continuing relay)")
-        elif msg["type"] == "join":
+        if isinstance(msg, LeaveMsg):
+            print(f"  [REMOTE LEAVE] idx={msg.index} (continuing relay)")
+        elif isinstance(msg, JoinMsg):
             # 追加の参加者 (将来対応)
             print(
-                f"  [REMOTE JOIN] idx={msg['index']}"
-                f" IP={msg['ip']} MAC={msg['mac']}"
+                f"  [REMOTE JOIN] idx={msg.index}"
+                f" IP={msg.ip} MAC={msg.mac}"
                 f" (additional participant, not yet supported)"
             )
 
@@ -682,29 +761,29 @@ async def handle_peer_messages_secondary(
             print("  [CTRL] Primary disconnected")
             break
 
-        if msg["type"] == "join":
-            print(f"  [REMOTE JOIN] idx={msg['index']} IP={msg['ip']} MAC={msg['mac']}")
+        if isinstance(msg, JoinMsg):
+            print(f"  [REMOTE JOIN] idx={msg.index} IP={msg.ip} MAC={msg.mac}")
             inject_virtual_participant(
                 network,
-                index=msg["index"],
-                ip=msg["ip"],
-                mac_str=msg["mac"],
-                name=bytes.fromhex(msg["name"]),
-                app_version=msg["app_version"],
-                platform=msg["platform"],
+                index=msg.index,
+                ip=msg.ip,
+                mac_str=msg.mac,
+                name=bytes.fromhex(msg.name),
+                app_version=msg.app_version,
+                platform=msg.platform,
             )
-        elif msg["type"] == "leave":
-            print(f"  [REMOTE LEAVE] idx={msg['index']}")
-            remove_virtual_participant(network, msg["index"])
-        elif msg["type"] == "app_data":
-            print(f"  [APP_DATA] updating ({len(msg['data']) // 2} bytes)")
-            network.set_application_data(bytes.fromhex(msg["data"]))
-        elif msg["type"] == "accept":
-            print(f"  [ACCEPT] policy={msg['policy']}")
-            network.set_accept_policy(msg["policy"])
-        elif msg["type"] == "connected":
-            primary_idx = msg["index"]
-            primary_ip = msg["ip"]
+        elif isinstance(msg, LeaveMsg):
+            print(f"  [REMOTE LEAVE] idx={msg.index}")
+            remove_virtual_participant(network, msg.index)
+        elif isinstance(msg, AppDataMsg):
+            print(f"  [APP_DATA] updating ({len(msg.data) // 2} bytes)")
+            network.set_application_data(bytes.fromhex(msg.data))
+        elif isinstance(msg, AcceptMsg):
+            print(f"  [ACCEPT] policy={msg.policy}")
+            network.set_accept_policy(msg.policy)
+        elif isinstance(msg, ConnectedMsg):
+            primary_idx = msg.index
+            primary_ip = msg.ip
             print(
                 f"  [CONNECTED] Primary STA assigned: idx={primary_idx} IP={primary_ip}"
             )
@@ -812,11 +891,7 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                             await send_msg(peer_stream, net_msg)
                             await send_msg(
                                 peer_stream,
-                                {
-                                    "type": "connected",
-                                    "index": sta_index,
-                                    "ip": sta_ip,
-                                },
+                                ConnectedMsg(index=sta_index, ip=sta_ip),
                             )
                             print("  NETWORK + CONNECTED sent, waiting for READY...")
 
@@ -826,7 +901,7 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                                 except (trio.ClosedResourceError, trio.EndOfChannel):
                                     print("  Secondary disconnected before READY")
                                     return
-                                if ready_msg["type"] == "ready":
+                                if isinstance(ready_msg, ReadyMsg):
                                     break
                                 print(
                                     f"  [WARN] Ignoring unexpected message: {ready_msg!r}"
@@ -888,15 +963,15 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
         # 3. Receive NETWORK
         while True:
             net_msg = await recv_msg(reader)
-            if net_msg["type"] == "network":
+            if isinstance(net_msg, NetworkMsg):
                 break
             print(f"  [WARN] Ignoring unexpected message: {net_msg!r}")
-        network_id = net_msg["network_id"]
-        host_p = net_msg["participants"][0]
+        network_id = net_msg.network_id
+        host_p = net_msg.participants[0]
         print(
             f"  Received NETWORK:"
-            f" game_id={net_msg['local_communication_id']:#018x}"
-            f" ch={net_msg['channel']} network_id={network_id}"
+            f" game_id={net_msg.local_communication_id:#018x}"
+            f" ch={net_msg.channel} network_id={network_id}"
         )
         print(f"  Host (Switch A): IP={host_p['ip']} MAC={host_p['mac']}")
         print()
@@ -917,7 +992,7 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
             )
 
             # 7. Signal ready
-            await send_msg(peer_stream, {"type": "ready"})
+            await send_msg(peer_stream, ReadyMsg())
 
             print(f"  subnet: 169.254.{network_id}.0/24")
             print(f"  participant 0 (Switch A): {host_p['ip']} {host_p['mac']}")
