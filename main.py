@@ -32,7 +32,7 @@ import json
 import types
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Generator
+from typing import Any, Generator
 
 import trio
 import ldn
@@ -204,7 +204,7 @@ def cleanup_stale_interfaces(ipr: IPRoute):
 
 @contextmanager
 def setup_tunnel(
-    ipr: IPRoute, local_ip, remote_ip
+    ipr: IPRoute, local_ip: str, remote_ip: str
 ) -> Generator[tuple[int, int], None, None]:
     """GRETAP トンネル + br-ldn ブリッジを構築し (idx_gretap, idx_br) を yield する。"""
     with (
@@ -238,7 +238,7 @@ def setup_tunnel(
 
 @contextmanager
 def setup_station_relay(
-    ipr: IPRoute, idx_gretap: int, idx_br: int, idx_ldn: int, ifname=IF_LDN
+    ipr: IPRoute, idx_gretap: int, idx_br: int, idx_ldn: int, ifname: str
 ) -> Generator[None, None, None]:
     """Primary: station IF と bridge 間の L2 リレーを tc mirred redirect で構成する。
 
@@ -296,7 +296,9 @@ def add_tap_to_bridge(
 # --- Monkey-patching (Secondary only) ---
 
 
-def patch_secondary_network(ipr: IPRoute, network, net_msg, idx_tap: int):
+def patch_secondary_network(
+    ipr: IPRoute, network: ldn.APNetwork, net_msg: dict[str, Any], idx_tap: int
+):
     """Secondary の APNetwork を Switch A のプロキシとしてパッチする。
 
     1. _network_id を Switch A のサブネット ID に統一
@@ -342,14 +344,14 @@ def patch_secondary_network(ipr: IPRoute, network, net_msg, idx_tap: int):
 
         self._peers.append(address)
 
-        participant = ldn.ParticipantInfo()
-        participant.ip_address = f"169.254.{self._network_id}.{target_index + 1}"
-        participant.mac_address = address
-        participant.connected = True
-        participant.name = name
-        participant.app_version = app_version
-        participant.platform = platform
-
+        participant = ldn.ParticipantInfo(
+            ip_address=f"169.254.{self._network_id}.{target_index + 1}",
+            mac_address=address,
+            connected=True,
+            name=name,
+            app_version=app_version,
+            platform=platform,
+        )
         self._network.participants[target_index] = participant
         self._network.num_participants += 1
         self._update_nonce()
@@ -366,23 +368,28 @@ def patch_secondary_network(ipr: IPRoute, network, net_msg, idx_tap: int):
 
 
 def inject_virtual_participant(
-    network, index, ip, mac_str, name, app_version, platform
+    network: ldn.APNetwork,
+    index: int,
+    ip: str,
+    mac_str: str,
+    name: bytes,
+    app_version: int,
+    platform: int,
 ):
     """対向拠点の参加者を仮想参加者としてアドバタイズメントに注入する。"""
-    participant = ldn.ParticipantInfo()
-    participant.ip_address = ip
-    participant.mac_address = ldn.MACAddress(mac_str)
-    participant.connected = True
-    participant.name = name
-    participant.app_version = app_version
-    participant.platform = platform
-
-    network._network.participants[index] = participant
+    network._network.participants[index] = ldn.ParticipantInfo(
+        ip_address=ip,
+        mac_address=ldn.MACAddress(mac_str),
+        connected=True,
+        name=name,
+        app_version=app_version,
+        platform=platform,
+    )
     network._network.num_participants += 1
     network._update_nonce()
 
 
-def remove_virtual_participant(network, index):
+def remove_virtual_participant(network: ldn.APNetwork, index: int):
     """仮想参加者をアドバタイズメントから除去する。"""
     participant = network._network.participants[index]
     if participant.connected:
@@ -397,11 +404,11 @@ def remove_virtual_participant(network, index):
 class LineReader:
     """trio.SocketStream をラップして行単位の読み取りを提供する。"""
 
-    def __init__(self, stream):
+    def __init__(self, stream: trio.SocketStream):
         self.stream = stream
         self._buf = b""
 
-    async def readline(self):
+    async def readline(self) -> bytes:
         while b"\n" not in self._buf:
             data = await self.stream.receive_some(4096)
             if not data:
@@ -411,12 +418,12 @@ class LineReader:
         return line
 
 
-async def send_msg(stream, msg):
+async def send_msg(stream: trio.SocketStream, msg: dict[str, Any]) -> None:
     data = json.dumps(msg).encode() + b"\n"
     await stream.send_all(data)
 
 
-async def recv_msg(reader):
+async def recv_msg(reader: LineReader) -> dict[str, Any]:
     line = await reader.readline()
     return json.loads(line)
 
@@ -424,7 +431,7 @@ async def recv_msg(reader):
 # --- Message builders ---
 
 
-def make_network_msg_from_scan(info):
+def make_network_msg_from_scan(info: ldn.NetworkInfo) -> dict[str, Any]:
     """scan 結果の NetworkInfo を NETWORK メッセージに変換する。
 
     scan() が返す NetworkInfo は advertisement frame を解析した結果であり、
@@ -480,7 +487,7 @@ def make_network_msg_from_scan(info):
     }
 
 
-def pick_secondary_channel(primary_channel):
+def pick_secondary_channel(primary_channel: int) -> int:
     """Secondary AP を Primary とは別のチャネルで運用する。
 
     同一チャネルだと Switch A が spoofed STA と実 Switch B の MAC 衝突を検知し
@@ -491,30 +498,32 @@ def pick_secondary_channel(primary_channel):
     return candidates[0]
 
 
-def make_create_param(keys, phy, msg, passphrase):
+def make_create_param(
+    keys: dict[str, bytes], phy: str, msg: dict[str, Any], passphrase: bytes
+) -> ldn.CreateNetworkParam:
     """NETWORK メッセージから CreateNetworkParam を構築する。"""
-    param = ldn.CreateNetworkParam()
-    param.keys = keys
-    param.phyname = phy
-    param.phyname_monitor = phy
-    param.local_communication_id = msg["local_communication_id"]
-    param.scene_id = msg["scene_id"]
-    param.channel = pick_secondary_channel(msg["channel"])
-    param.protocol = msg["protocol"]
-    param.version = msg["version"]
-    param.app_version = msg["app_version"]
-    param.max_participants = msg["max_participants"]
-    param.security_mode = msg["security_mode"]
-    param.accept_policy = msg["accept_policy"]
-    param.application_data = bytes.fromhex(msg["application_data"])
-    param.server_random = bytes.fromhex(msg["server_random"])
-    param.ssid = bytes.fromhex(msg["ssid"])
-    param.password = passphrase
-    param.name = b"LDN-Tunnel"
-    return param
+    return ldn.CreateNetworkParam(
+        keys=keys,
+        phyname=phy,
+        phyname_monitor=phy,
+        local_communication_id=msg["local_communication_id"],
+        scene_id=msg["scene_id"],
+        channel=pick_secondary_channel(msg["channel"]),
+        protocol=msg["protocol"],
+        version=msg["version"],
+        app_version=msg["app_version"],
+        max_participants=msg["max_participants"],
+        security_mode=msg["security_mode"],
+        accept_policy=msg["accept_policy"],
+        application_data=bytes.fromhex(msg["application_data"]),
+        server_random=bytes.fromhex(msg["server_random"]),
+        ssid=bytes.fromhex(msg["ssid"]),
+        password=passphrase,
+        name=b"LDN-Tunnel",
+    )
 
 
-def make_join_msg(index, participant):
+def make_join_msg(index: int, participant: ldn.ParticipantInfo) -> dict[str, Any]:
     return {
         "type": "join",
         "index": index,
@@ -526,14 +535,14 @@ def make_join_msg(index, participant):
     }
 
 
-def make_leave_msg(index):
+def make_leave_msg(index: int) -> dict[str, Any]:
     return {"type": "leave", "index": index}
 
 
 # --- LDN scan ---
 
 
-async def scan_ldn(keys, phy):
+async def scan_ldn(keys: dict[str, bytes], phy: str) -> ldn.NetworkInfo | None:
     for attempt in range(10):
         print(f"Scan {attempt + 1}/10...", end=" ", flush=True)
         networks = await ldn.scan(
@@ -553,7 +562,9 @@ async def scan_ldn(keys, phy):
 # --- Event handling ---
 
 
-async def handle_primary_events(sta, peer_stream, relay_mac):
+async def handle_primary_events(
+    sta: ldn.STANetwork, peer_stream: trio.SocketStream, relay_mac: str
+) -> None:
     """Primary: STANetwork のイベントを監視し、制御チャネルで Secondary に転送する。
 
     relay_mac: 自身の STA MAC (= Switch B の MAC)。
@@ -606,7 +617,9 @@ async def handle_primary_events(sta, peer_stream, relay_mac):
         pass
 
 
-async def handle_secondary_events(network, peer_stream):
+async def handle_secondary_events(
+    network: ldn.APNetwork, peer_stream: trio.SocketStream
+) -> None:
     """Secondary: APNetwork のローカルイベントを監視し、Primary に転送する。
 
     Switch B が参加/離脱した際に Primary へ通知する。
@@ -630,7 +643,7 @@ async def handle_secondary_events(network, peer_stream):
             await send_msg(peer_stream, make_leave_msg(event.index))
 
 
-async def handle_peer_messages_primary(reader):
+async def handle_peer_messages_primary(reader: LineReader) -> None:
     """Primary: Secondary からのメッセージを処理する。
 
     LEAVE はログに記録するのみ (自動終了しない)。
@@ -654,7 +667,9 @@ async def handle_peer_messages_primary(reader):
             )
 
 
-async def handle_peer_messages_secondary(network, reader):
+async def handle_peer_messages_secondary(
+    network: ldn.APNetwork, reader: LineReader
+) -> None:
     """Secondary: Primary からの JOIN/LEAVE/APP_DATA/ACCEPT を処理する。"""
     while True:
         try:
@@ -734,13 +749,14 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
 
         # 3. STA 接続 (Switch B 参加前に relay を完成させる)
         print(f"=== 3. Connecting to Switch A as {config.switch_b_mac} ===")
-        param = ldn.ConnectNetworkParam()
-        param.keys = config.keys
-        param.phyname = config.phy
-        param.network = info
-        param.password = config.ldn_passphrase or b""
-        param.name = b"LDN-Tunnel"
-        param.address = ldn.MACAddress(config.switch_b_mac)
+        param = ldn.ConnectNetworkParam(
+            keys=config.keys,
+            phyname=config.phy,
+            network=info,
+            password=config.ldn_passphrase or b"",
+            name=b"LDN-Tunnel",
+            address=ldn.MACAddress(config.switch_b_mac),
+        )
 
         max_connect_attempts = 3
         for attempt in range(max_connect_attempts):
@@ -766,7 +782,9 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
 
                     # 4. Relay 構築 (Switch B 参加前に完成)
                     print("=== 4. Setting up relay ===")
-                    with setup_station_relay(ipr, idx_gretap, idx_br, sta.ifindex):
+                    with setup_station_relay(
+                        ipr, idx_gretap, idx_br, sta.ifindex, IF_LDN
+                    ):
                         print()
 
                         # 5. Secondary 待機
