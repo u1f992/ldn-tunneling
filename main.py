@@ -67,11 +67,6 @@ def _disable_ipv6(ifname: str):
         f.write("1")
 
 
-def _ifindex(ipr: IPRoute, ifname: str) -> int | None:
-    idx = ipr.link_lookup(ifname=ifname)
-    return idx[0] if idx else None
-
-
 @contextmanager
 def _link_create(ipr: IPRoute, ifname: str, **kwargs) -> Generator[int, None, None]:
     """インターフェースを作成し、yield で ifindex を返す。with 離脱時に自動削除。"""
@@ -98,6 +93,11 @@ def _veth_create(
 
 
 # --- Network infrastructure ---
+
+
+def _ifindex(ipr: IPRoute, ifname: str) -> int | None:
+    idx = ipr.link_lookup(ifname=ifname)
+    return idx[0] if idx else None
 
 
 def cleanup_stale_interfaces(ipr: IPRoute):
@@ -177,7 +177,7 @@ def setup_tunnel(
 
 @contextmanager
 def setup_station_relay(
-    ipr: IPRoute, idx_gretap: int, idx_br: int, ifname=IF_LDN
+    ipr: IPRoute, idx_gretap: int, idx_br: int, idx_ldn: int, ifname=IF_LDN
 ) -> Generator[None, None, None]:
     """Primary: station IF と bridge 間の L2 リレーを tc mirred redirect で構成する。
 
@@ -212,9 +212,6 @@ def setup_station_relay(
         ipr.brport("set", index=idx_gretap, learning=0)
 
         # tc ingress redirect: station IF → relay-sta
-        idx_ldn = _ifindex(ipr, ifname)
-        if idx_ldn is None:
-            raise RuntimeError(f"Interface {ifname!r} not found")
         _log_netlink(
             f"tc add ingress dev {ifname}; tc add-filter u32 mirred redirect → {IF_RELAY_STA}"
         )
@@ -272,21 +269,10 @@ def setup_station_relay(
                 pass
 
 
-def add_tap_to_bridge(ipr: IPRoute, idx_gretap: int, idx_br: int):
+def add_tap_to_bridge(
+    ipr: IPRoute, idx_gretap: int, idx_br: int, idx_tap: int, idx_mon: int
+):
     """Secondary: TAP を br-ldn に追加する。MAC learning 無効化でフラッディング強制。"""
-
-    idx_tap = _ifindex(ipr, IF_LDN_TAP)
-    idx_mon = _ifindex(ipr, IF_LDN_MON)
-    if None in (idx_tap, idx_mon):
-        missing = [
-            n
-            for n, i in [
-                (IF_LDN_TAP, idx_tap),
-                (IF_LDN_MON, idx_mon),
-            ]
-            if i is None
-        ]
-        raise RuntimeError(f"Interface(s) not found: {', '.join(missing)}")
 
     _log_netlink(f"link set {IF_LDN_TAP} master {IF_BRIDGE}")
     ipr.link("set", index=idx_tap, master=idx_br)
@@ -309,7 +295,7 @@ def add_tap_to_bridge(ipr: IPRoute, idx_gretap: int, idx_br: int):
 # --- Monkey-patching (Secondary only) ---
 
 
-def patch_secondary_network(ipr: IPRoute, network, net_msg):
+def patch_secondary_network(ipr: IPRoute, network, net_msg, idx_tap: int):
     """Secondary の APNetwork を Switch A のプロキシとしてパッチする。
 
     1. _network_id を Switch A のサブネット ID に統一
@@ -332,9 +318,6 @@ def patch_secondary_network(ipr: IPRoute, network, net_msg):
     p0.platform = host["platform"]
 
     # 3. TAP IP を .254 に設定
-    idx_tap = _ifindex(ipr, IF_LDN_TAP)
-    if idx_tap is None:
-        raise RuntimeError(f"Interface {IF_LDN_TAP} not found")
     ipr.flush_addr(index=idx_tap)
     ipr.addr(
         "add",
@@ -723,7 +706,6 @@ async def handle_peer_messages_secondary(network, reader):
 
 async def run_primary(ipr: IPRoute, args):
     keys = ldn.load_keys(args.keys)
-    cleanup_stale_interfaces(ipr)
 
     # 1. Scan (STA 接続はしない — scan 結果から全情報を取得)
     print("=== 1. Scan for LDN network ===")
@@ -832,7 +814,7 @@ async def run_primary(ipr: IPRoute, args):
 
                     # 4. Relay 構築 (Switch B 参加前に完成)
                     print("=== 4. Setting up relay ===")
-                    with setup_station_relay(ipr, idx_gretap, idx_br):
+                    with setup_station_relay(ipr, idx_gretap, idx_br, sta.ifindex):
                         print()
 
                         # 5. Secondary 待機
@@ -912,7 +894,6 @@ async def run_primary(ipr: IPRoute, args):
 
 async def run_secondary(ipr: IPRoute, args):
     keys = ldn.load_keys(args.keys)
-    cleanup_stale_interfaces(ipr)
 
     # 1. GRETAP + bridge
     print("=== 1. GRETAP tunnel + bridge ===")
@@ -944,10 +925,12 @@ async def run_secondary(ipr: IPRoute, args):
 
         async with ldn.create_network(param) as network:
             # 5. Patch: Switch A のプロキシとして構成
-            patch_secondary_network(ipr, network, net_msg)
+            patch_secondary_network(ipr, network, net_msg, network.ifindex_tap)
 
             # 6. Bridge TAP
-            add_tap_to_bridge(ipr, idx_gretap, idx_br)
+            add_tap_to_bridge(
+                ipr, idx_gretap, idx_br, network.ifindex_tap, network.ifindex_monitor
+            )
 
             # 7. Signal ready
             await send_msg(peer_stream, {"type": "ready"})
@@ -1002,6 +985,7 @@ async def main():
         args.ldn_passphrase = f.read()
 
     with IPRoute() as ipr:
+        cleanup_stale_interfaces(ipr)
         if args.role == "primary":
             await run_primary(ipr, args)
         else:

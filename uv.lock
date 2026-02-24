@@ -46,7 +46,7 @@ wheels = [
 [[package]]
 name = "ldn"
 version = "0.0.16"
-source = { git = "https://github.com/u1f992/LDN.git?rev=7289995ba07b65ad05ee556b705bec43b3fcd06c#7289995ba07b65ad05ee556b705bec43b3fcd06c" }
+source = { git = "https://github.com/u1f992/LDN.git?rev=b45165aad9782364ac7c8f158bcab1a205688d4d#b45165aad9782364ac7c8f158bcab1a205688d4d" }
 dependencies = [
     { name = "pycryptodome" },
     { name = "python-netlink" },
@@ -63,7 +63,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ldn", git = "https://github.com/u1f992/LDN.git?rev=7289995ba07b65ad05ee556b705bec43b3fcd06c" },
+    { name = "ldn", git = "https://github.com/u1f992/LDN.git?rev=b45165aad9782364ac7c8f158bcab1a205688d4d" },
     { name = "pyroute2", specifier = ">=0.9.5" },
 ]
 
