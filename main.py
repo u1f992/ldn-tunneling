@@ -1,20 +1,24 @@
-"""LDN Tunnel Node v4 - MAC-spoofed STA relay
+r"""LDN Tunnel Node v4 - MAC-spoofed STA relay
 
 Prerequisites:
+  # setcap cannot operate on symlinks; use --copies to place a real binary.
+  # uv does not support --copies yet: https://github.com/astral-sh/uv/issues/17754
+  python3 -m venv --copies .venv
+  uv sync
   sudo setcap cap_net_admin,cap_net_raw+ep .venv/bin/python
   # CAP_NET_ADMIN: netlink (nl80211, rtnetlink, tc), /dev/net/tun ioctl, /proc/sys/net writes
   # CAP_NET_RAW:   AF_PACKET SOCK_RAW sockets (monitor-mode frame I/O)
 
 Usage:
-  Primary:   .venv/bin/python main.py prod.keys --role primary   --local <wg_ip> --remote <wg_ip> --phy phy1 --switch-b-mac <MAC> --ldn-passphrase <FILE>
-  Secondary: .venv/bin/python main.py prod.keys --role secondary --local <wg_ip> --remote <wg_ip> --phy phy1 --ldn-passphrase <FILE>
+  Primary:   .venv/bin/python main.py prod.keys --role primary   --local <ip> --remote <ip> --phy phy1 --switch-b-mac <MAC> --ldn-passphrase <FILE>
+  Secondary: .venv/bin/python main.py prod.keys --role secondary --local <ip> --remote <ip> --phy phy1 --ldn-passphrase <FILE>
 
 LDN passphrases for some games are published at:
   https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases
 
 Example (MK8DX):
-  printf 'MarioKart8Delux\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00' > mk8dx.pass
-  .venv/bin/python main.py prod.keys --role primary --local 10.0.0.1 --remote 10.0.0.2 --phy phy1 --switch-b-mac 64:B5:C6:1B:14:9B --ldn-passphrase mk8dx.pass
+  printf 'MarioKart8Delux\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' > mk8dx.bin
+  .venv/bin/python main.py prod.keys --role primary --local 10.0.0.1 --remote 10.0.0.2 --phy phy1 --switch-b-mac 64:B5:C6:1B:14:9B --ldn-passphrase mk8dx.bin
 
 v4 MAC-spoof relay architecture:
   Primary (PC A):   Connects to Switch A's AP as STA using Switch B's MAC.
@@ -34,15 +38,15 @@ v4 MAC-spoof relay architecture:
 """
 
 import argparse
+from contextlib import contextmanager
 import dataclasses
+from dataclasses import dataclass, field
 import ipaddress
 import json
 import logging
 import socket
 import struct
 import types
-from contextlib import contextmanager
-from dataclasses import dataclass, field
 from typing import Any, Generator
 
 import trio
@@ -506,7 +510,7 @@ def patch_secondary_network(
         )
         await self._events.put(ldn.JoinEvent(target_index, participant))
 
-    network._register_participant = types.MethodType(patched_register, network)
+    network._register_participant = types.MethodType(patched_register, network)  # type: ignore[method-assign]
 
     # Update advertisement
     network._update_nonce()
@@ -584,42 +588,9 @@ def make_network_msg_from_scan(info: ldn.NetworkInfo) -> NetworkMsg:
     scan() returns a NetworkInfo parsed from an advertisement frame,
     so all information is available without STA association.
     """
-    # Extract the 3rd octet X from the host IP (169.254.X.1) as network_id
-    network_id = ipaddress.IPv4Address(info.participants[0].ip_address).packed[2]
-
-    participants = tuple(
-        [
-            NetworkParticipant(
-                index=i,
-                ip=p.ip_address,
-                mac=str(p.mac_address),
-                connected=p.connected,
-                name=p.name.hex() if p.name else "",
-                app_version=p.app_version,
-                platform=p.platform,
-            )
-            for i, p in enumerate(info.participants)
-        ]
-        + [
-            NetworkParticipant(
-                index=i,
-                ip="",
-                mac="00:00:00:00:00:00",
-                connected=False,
-                name="",
-                app_version=0,
-                platform=0,
-            )
-            # LDN has exactly 8 participant slots (CreateNetworkParam.max_participants).
-            # See https://github.com/kinnay/NintendoClients/wiki/LDN-Protocol
-            for i in range(
-                len(info.participants), ldn.CreateNetworkParam.max_participants
-            )
-        ]
-    )
-
     return NetworkMsg(
-        network_id=network_id,
+        # Extract the 3rd octet X from the host IP (169.254.X.1) as network_id
+        network_id=ipaddress.IPv4Address(info.participants[0].ip_address).packed[2],
         local_communication_id=info.local_communication_id,
         scene_id=info.scene_id,
         channel=info.channel,
@@ -632,7 +603,36 @@ def make_network_msg_from_scan(info: ldn.NetworkInfo) -> NetworkMsg:
         application_data=info.application_data.hex(),
         server_random=info.server_random.hex(),
         ssid=info.ssid.hex(),
-        participants=participants,  # type: ignore[arg-type]
+        participants=tuple(
+            [
+                NetworkParticipant(
+                    index=i,
+                    ip=p.ip_address,
+                    mac=str(p.mac_address),
+                    connected=p.connected,
+                    name=p.name.hex() if p.name else "",
+                    app_version=p.app_version,
+                    platform=p.platform,
+                )
+                for i, p in enumerate(info.participants)
+            ]
+            + [
+                NetworkParticipant(
+                    index=i,
+                    ip="",
+                    mac="00:00:00:00:00:00",
+                    connected=False,
+                    name="",
+                    app_version=0,
+                    platform=0,
+                )
+                # LDN has exactly 8 participant slots (CreateNetworkParam.max_participants).
+                # See https://github.com/kinnay/NintendoClients/wiki/LDN-Protocol
+                for i in range(
+                    len(info.participants), ldn.CreateNetworkParam.max_participants
+                )
+            ]
+        ),  # type: ignore[arg-type]
     )
 
 
@@ -726,19 +726,24 @@ async def handle_primary_events(
                     p = event.participant
                     # Skip our own join event
                     if str(p.mac_address) == relay_mac:
-                        logger.info("PRIMARY JOIN idx=%d (self, skipping relay)", event.index)
+                        logger.info(
+                            "PRIMARY JOIN idx=%d (self, skipping relay)", event.index
+                        )
                         continue
                     logger.info(
                         "PRIMARY JOIN idx=%d %s IP=%s MAC=%s",
-                        event.index, p.name.decode(errors="replace"),
-                        p.ip_address, p.mac_address,
+                        event.index,
+                        p.name.decode(errors="replace"),
+                        p.ip_address,
+                        p.mac_address,
                     )
                     await send_msg(peer_stream, make_join_msg(event.index, p))
                 case ldn.LeaveEvent():
                     p = event.participant
                     logger.info(
                         "PRIMARY LEAVE idx=%d %s",
-                        event.index, p.name.decode(errors="replace"),
+                        event.index,
+                        p.name.decode(errors="replace"),
                     )
                     await send_msg(peer_stream, make_leave_msg(event.index))
                 case ldn.ApplicationDataChanged():
@@ -768,15 +773,18 @@ async def handle_secondary_events(
                 p = event.participant
                 logger.info(
                     "SECONDARY JOIN idx=%d %s IP=%s MAC=%s",
-                    event.index, p.name.decode(errors="replace"),
-                    p.ip_address, p.mac_address,
+                    event.index,
+                    p.name.decode(errors="replace"),
+                    p.ip_address,
+                    p.mac_address,
                 )
                 await send_msg(peer_stream, make_join_msg(event.index, p))
             case ldn.LeaveEvent():
                 p = event.participant
                 logger.info(
                     "SECONDARY LEAVE idx=%d %s",
-                    event.index, p.name.decode(errors="replace"),
+                    event.index,
+                    p.name.decode(errors="replace"),
                 )
                 await send_msg(peer_stream, make_leave_msg(event.index))
 
@@ -804,7 +812,9 @@ async def handle_peer_messages_primary(reader: LineReader) -> None:
                 # Additional participants (future support)
                 logger.info(
                     "REMOTE JOIN idx=%d IP=%s MAC=%s (additional participant, not yet supported)",
-                    msg.index, msg.ip, msg.mac,
+                    msg.index,
+                    msg.ip,
+                    msg.mac,
                 )
 
 
@@ -824,7 +834,9 @@ async def handle_peer_messages_secondary(
 
         match msg:
             case JoinMsg():
-                logger.info("REMOTE JOIN idx=%d IP=%s MAC=%s", msg.index, msg.ip, msg.mac)
+                logger.info(
+                    "REMOTE JOIN idx=%d IP=%s MAC=%s", msg.index, msg.ip, msg.mac
+                )
                 inject_virtual_participant(
                     network,
                     index=msg.index,
@@ -846,7 +858,8 @@ async def handle_peer_messages_secondary(
             case ConnectedMsg():
                 logger.info(
                     "CONNECTED Primary STA assigned: idx=%d IP=%s",
-                    msg.index, msg.ip,
+                    msg.index,
+                    msg.ip,
                 )
                 # Verify that the IP matches Switch B's
                 for idx, p in enumerate(network._network.participants):
@@ -854,7 +867,8 @@ async def handle_peer_messages_secondary(
                         if p.ip_address != msg.ip:
                             logger.warning(
                                 "IP mismatch: Switch B has %s, Primary expects %s",
-                                p.ip_address, msg.ip,
+                                p.ip_address,
+                                msg.ip,
                             )
                         else:
                             logger.info("IP match: %s", p.ip_address)
@@ -863,9 +877,13 @@ async def handle_peer_messages_secondary(
 # --- Packet trace (TRACE level) ---
 
 _TRACE_INTERFACES = (
-    IF_LDN, IF_LDN_MON, IF_LDN_TAP,
-    IF_RELAY_STA, IF_RELAY_BR,
-    IF_BRIDGE, IF_GRETAP,
+    IF_LDN,
+    IF_LDN_MON,
+    IF_LDN_TAP,
+    IF_RELAY_STA,
+    IF_RELAY_BR,
+    IF_BRIDGE,
+    IF_GRETAP,
 )
 
 ETH_P_ALL = 0x0003
@@ -891,7 +909,11 @@ async def _capture_packets(ifname: str) -> None:
             logger.log(
                 TRACE,
                 "%s %s > %s ethertype=0x%04x len=%d",
-                ifname, src, dst, ethertype, len(data),
+                ifname,
+                src,
+                dst,
+                ethertype,
+                len(data),
             )
     except OSError:
         pass
@@ -912,7 +934,9 @@ def _start_packet_trace(nursery: trio.Nursery, ipr: IPRoute) -> None:
 
 async def run_primary(ipr: IPRoute, config: PrimaryConfig):
     # 1. Scan (no STA association; all info is obtained from the scan result)
-    logger.info("Scanning for LDN network (create a local-communication room on Switch A)")
+    logger.info(
+        "Scanning for LDN network (create a local-communication room on Switch A)"
+    )
     info = await scan_ldn(config.keys, config.phy)
     if info is None:
         logger.error("LDN network not found")
@@ -921,14 +945,18 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
     host = info.participants[0]
     logger.info(
         "Found network: ch=%d proto=%d ver=%d app_ver=%d BSSID=%s host_ip=%s host_mac=%s",
-        info.channel, info.protocol, info.version, info.app_version,
-        info.address, host.ip_address, host.mac_address,
+        info.channel,
+        info.protocol,
+        info.version,
+        info.app_version,
+        info.address,
+        host.ip_address,
+        host.mac_address,
     )
 
     # 2. GRETAP tunnel + bridge
     logger.info("Setting up GRETAP tunnel + bridge")
     with setup_tunnel(ipr, config.local, config.remote) as (idx_gretap, idx_br):
-
         # 3. STA connect (complete the relay before Switch B joins)
         logger.info("Connecting to Switch A as %s", config.switch_b_mac)
         param = ldn.ConnectNetworkParam(
@@ -943,7 +971,9 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
         max_connect_attempts = 3
         for attempt in range(max_connect_attempts):
             if attempt > 0:
-                logger.info("Retry %d/%d in 2 seconds", attempt + 1, max_connect_attempts)
+                logger.info(
+                    "Retry %d/%d in 2 seconds", attempt + 1, max_connect_attempts
+                )
                 await trio.sleep(2)
                 logger.info("Re-scanning...")
                 fresh_info = await scan_ldn(config.keys, config.phy)
@@ -959,7 +989,9 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                     sta_ip = sta.participant().ip_address
                     logger.info(
                         "Connected: participant=%d IP=%s MAC=%s (spoofed)",
-                        sta_index, sta_ip, config.switch_b_mac,
+                        sta_index,
+                        sta_ip,
+                        config.switch_b_mac,
                     )
 
                     # 4. Relay setup (completed before Switch B joins)
@@ -967,7 +999,6 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                     with setup_station_relay(
                         ipr, idx_gretap, idx_br, sta.ifindex, IF_LDN
                     ):
-
                         # 5. Wait for Secondary
                         listeners = await trio.open_tcp_listeners(
                             config.control_port, host=config.local
@@ -975,7 +1006,8 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                         try:
                             logger.info(
                                 "Waiting for secondary on %s:%d",
-                                config.local, config.control_port,
+                                config.local,
+                                config.control_port,
                             )
 
                             peer_stream = await listeners[0].accept()
@@ -1009,7 +1041,9 @@ async def run_primary(ipr: IPRoute, config: PrimaryConfig):
                                             ready_msg,
                                         )
                             logger.info("Secondary is ready")
-                            logger.info("Join via local communication on Switch B (Ctrl+C to exit)")
+                            logger.info(
+                                "Join via local communication on Switch B (Ctrl+C to exit)"
+                            )
 
                             # 7. Event loop
                             async with trio.open_nursery() as nursery:
@@ -1047,9 +1081,10 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
     # 1. GRETAP + bridge
     logger.info("Setting up GRETAP tunnel + bridge")
     with setup_tunnel(ipr, config.local, config.remote) as (idx_gretap, idx_br):
-
         # 2. Connect to primary
-        logger.info("Connecting to primary at %s:%d", config.remote, config.control_port)
+        logger.info(
+            "Connecting to primary at %s:%d", config.remote, config.control_port
+        )
         peer_stream = await trio.open_tcp_stream(config.remote, config.control_port)
         reader = LineReader(peer_stream)
         logger.info("Connected to primary")
@@ -1070,8 +1105,11 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
         host_p = net_msg.participants[0]
         logger.info(
             "Received NETWORK: game_id=%#018x ch=%d network_id=%d host_ip=%s host_mac=%s",
-            net_msg.local_communication_id, net_msg.channel,
-            network_id, host_p.ip, host_p.mac,
+            net_msg.local_communication_id,
+            net_msg.channel,
+            network_id,
+            host_p.ip,
+            host_p.mac,
         )
 
         # 4. Host proxy LDN
@@ -1094,7 +1132,9 @@ async def run_secondary(ipr: IPRoute, config: SecondaryConfig):
 
             logger.info(
                 "Ready: subnet=169.254.%d.0/24 participant_0=%s/%s (Ctrl+C to exit)",
-                network_id, host_p.ip, host_p.mac,
+                network_id,
+                host_p.ip,
+                host_p.mac,
             )
 
             async with trio.open_nursery() as nursery:
@@ -1139,6 +1179,12 @@ async def main():
         help="Logging verbosity (default: info)",
     )
     args = parser.parse_args()
+
+    level = (
+        TRACE if args.log_level == "trace" else getattr(logging, args.log_level.upper())
+    )
+    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+
     if args.ldn_passphrase is not None:
         with open(args.ldn_passphrase, "rb") as f:
             passphrase = f.read()
@@ -1153,9 +1199,6 @@ async def main():
         remote=args.remote,
         control_port=args.control_port,
     )
-
-    level = TRACE if args.log_level == "trace" else getattr(logging, args.log_level.upper())
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
 
     with IPRoute() as ipr:
         cleanup_stale_interfaces(ipr)
