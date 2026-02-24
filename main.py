@@ -1,25 +1,5 @@
 r"""LDN Tunnel Node v4 - MAC-spoofed STA relay
 
-Prerequisites:
-  # setcap cannot operate on symlinks; use --copies to place a real binary.
-  # uv does not support --copies yet: https://github.com/astral-sh/uv/issues/17754
-  python3 -m venv --copies .venv
-  uv sync
-  sudo setcap cap_net_admin,cap_net_raw+ep .venv/bin/python
-  # CAP_NET_ADMIN: netlink (nl80211, rtnetlink, tc), /dev/net/tun ioctl, /proc/sys/net writes
-  # CAP_NET_RAW:   AF_PACKET SOCK_RAW sockets (monitor-mode frame I/O)
-
-Usage:
-  Primary:   .venv/bin/python main.py prod.keys --role primary   --local <ip> --remote <ip> --phy phy1 --switch-b-mac <MAC> --ldn-passphrase <FILE>
-  Secondary: .venv/bin/python main.py prod.keys --role secondary --local <ip> --remote <ip> --phy phy1 --ldn-passphrase <FILE>
-
-LDN passphrases for some games are published at:
-  https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases
-
-Example (MK8DX):
-  printf 'MarioKart8Delux\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' > mk8dx.bin
-  .venv/bin/python main.py prod.keys --role primary --local 10.0.0.1 --remote 10.0.0.2 --phy phy1 --switch-b-mac 64:B5:C6:1B:14:9B --ldn-passphrase mk8dx.bin
-
 v4 MAC-spoof relay architecture:
   Primary (PC A):   Connects to Switch A's AP as STA using Switch B's MAC.
                     Switch A sees Switch B as a direct participant.
