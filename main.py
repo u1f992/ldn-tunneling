@@ -23,12 +23,14 @@ v4 MAC スプーフリレーアーキテクチャ:
 
 import argparse
 import json
-import subprocess
-import sys
 import types
 
 import trio
 import ldn
+from pyroute2 import IPRoute, protocols
+from pyroute2.netlink.exceptions import NetlinkError
+from pyroute2.netlink.rtnl import TC_H_ROOT
+
 
 # --- Constants ---
 
@@ -40,80 +42,102 @@ MK8DX_PASSWORD = (
 CONTROL_PORT = 39571
 
 
-# --- Shell helpers ---
+# --- pyroute2 helpers ---
 
 
-def run(cmd):
-    print(f"  # {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+def _log_netlink(desc: str):
+    print(f"  # [pyroute2] {desc}")
 
 
-def run_quiet(cmd):
-    subprocess.run(
-        cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+def _disable_ipv6(ifname: str):
+    """procfs 直書き (sysctl subprocess の代替)"""
+    with open(f"/proc/sys/net/ipv6/conf/{ifname}/disable_ipv6", "w") as f:
+        f.write("1")
+
+
+def _ifindex(ipr: IPRoute, ifname: str) -> int | None:
+    idx = ipr.link_lookup(ifname=ifname)
+    return idx[0] if idx else None
+
+
+def _link_create(ipr: IPRoute, ifname: str, **kwargs) -> int:
+    """インターフェースを作成し、その ifindex を返す。"""
+    ipr.link("add", ifname=ifname, **kwargs)
+    idx = ipr.link_lookup(ifname=ifname)
+    if not idx:
+        raise RuntimeError(f"Failed to create interface {ifname!r}")
+    return idx[0]
 
 
 # --- Network infrastructure ---
 
 
-def cleanup_stale_interfaces():
+def cleanup_stale_interfaces(ipr: IPRoute):
     """前回の異常終了で残った LDN インターフェースを削除する。"""
-    # nl80211 仮想インターフェース (iw dev del が確実)
-    for ifname in ["ldn", "ldn-mon"]:
-        run_quiet(["iw", "dev", ifname, "del"])
-    # 通常のインターフェース
-    for ifname in ["ldn-tap", "relay-sta", "br-ldn", "gretap1"]:
-        run_quiet(["ip", "link", "del", ifname])
-    run_quiet(["tc", "qdisc", "del", "dev", "ldn", "ingress"])
-    # iptables / policy routing 残骸
-    run_quiet(["iptables", "-t", "nat", "-F", "POSTROUTING"])
-    run_quiet(["iptables", "-F", "FORWARD"])
-    run_quiet(["ip", "rule", "del", "table", "100"])
-    run_quiet(["ip", "route", "flush", "table", "100"])
+    # nl80211 仮想 IF も RTM_DELLINK で削除可能
+    for ifname in ["ldn", "ldn-mon", "ldn-tap", "relay-sta", "br-ldn", "gretap1"]:
+        idx = _ifindex(ipr, ifname)
+        if idx is not None:
+            try:
+                ipr.link("del", index=idx)
+            except NetlinkError:
+                pass
+    # tc ingress qdisc (ldn が既に削除されていれば不要だが念のため)
+    idx = _ifindex(ipr, "ldn")
+    if idx is not None:
+        try:
+            ipr.tc("del", "ingress", index=idx)
+        except NetlinkError:
+            pass
+    # policy routing 残骸
+    try:
+        ipr.rule("del", table=100)
+    except NetlinkError:
+        pass
+    try:
+        ipr.flush_routes(table=100)
+    except NetlinkError:
+        pass
 
 
-def setup_tunnel(local_ip, remote_ip):
+def setup_tunnel(ipr: IPRoute, local_ip, remote_ip):
     """GRETAP トンネル + br-ldn ブリッジを構築する。Primary/Secondary 共用。"""
-    run(
-        [
-            "ip",
-            "link",
-            "add",
-            "gretap1",
-            "type",
-            "gretap",
-            "local",
-            local_ip,
-            "remote",
-            remote_ip,
-            "key",
-            "1",
-            "nopmtudisc",
-        ]
+    # GRETAP tunnel: key 1, nopmtudisc
+    # gre_iflags/gre_oflags=0x2000 = GRE_KEY flag (big-endian)
+    _log_netlink(
+        f"link add gretap1 type gretap local {local_ip} remote {remote_ip} key 1 nopmtudisc"
     )
-    run(["ip", "link", "set", "gretap1", "mtu", "1500"])
-    run(["ip", "link", "set", "gretap1", "up"])
-    run(
-        [
-            "ip",
-            "link",
-            "add",
-            "br-ldn",
-            "type",
-            "bridge",
-            "stp_state",
-            "0",
-            "forward_delay",
-            "0",
-        ]
+    idx_gretap = _link_create(
+        ipr,
+        "gretap1",
+        kind="gretap",
+        gre_local=local_ip,
+        gre_remote=remote_ip,
+        gre_ikey=1,
+        gre_okey=1,
+        gre_iflags=0x2000,
+        gre_oflags=0x2000,
+        gre_pmtudisc=0,
     )
-    run(["ip", "link", "set", "br-ldn", "up"])
-    run(["ip", "link", "set", "gretap1", "master", "br-ldn"])
-    run(["sysctl", "-w", "net.ipv6.conf.br-ldn.disable_ipv6=1"])
+    _log_netlink("link set gretap1 mtu 1500 up")
+    ipr.link("set", index=idx_gretap, mtu=1500, state="up")
+
+    # Bridge
+    _log_netlink("link add br-ldn type bridge stp_state 0 forward_delay 0")
+    idx_br = _link_create(
+        ipr, "br-ldn", kind="bridge", br_stp_state=0, br_forward_delay=0
+    )
+    _log_netlink("link set br-ldn up")
+    ipr.link("set", index=idx_br, state="up")
+
+    _log_netlink("link set gretap1 master br-ldn")
+    ipr.link("set", index=idx_gretap, master=idx_br)
+
+    _log_netlink("disable_ipv6 br-ldn")
+    _disable_ipv6("br-ldn")
 
 
-def setup_station_relay(ifname="ldn"):
+def setup_station_relay(ipr: IPRoute, ifname="ldn"):
     """Primary: station IF と bridge 間の L2 リレーを tc mirred redirect で構成する。
 
     managed-mode WiFi STA は直接 bridge に追加できない (EOPNOTSUPP) ため、
@@ -123,101 +147,144 @@ def setup_station_relay(ifname="ldn"):
     bridge ポートが 2 つ (relay-br + gretap1) のみなので、
     フレームは到着ポート以外の全ポート (= もう 1 つ) に転送される。ループなし。
     """
-    # veth pair 作成
-    run(["ip", "link", "add", "relay-sta", "type", "veth", "peer", "name", "relay-br"])
-    run(["ip", "link", "set", "relay-sta", "up"])
-    run(["ip", "link", "set", "relay-br", "up"])
+    # veth pair 作成 (_link_create は ifname 側の index を返す; peer は同時に作成される)
+    _log_netlink("link add relay-sta type veth peer relay-br")
+    idx_relay_sta = _link_create(ipr, "relay-sta", kind="veth", peer="relay-br")
+    idx_relay_br = _ifindex(ipr, "relay-br")
+    if idx_relay_br is None:
+        raise RuntimeError("Failed to create veth peer relay-br")
+
+    _log_netlink("link set relay-sta up; link set relay-br up")
+    ipr.link("set", index=idx_relay_sta, state="up")
+    ipr.link("set", index=idx_relay_br, state="up")
 
     # relay-br を bridge に追加
-    run(["ip", "link", "set", "relay-br", "master", "br-ldn"])
+    idx_br = _ifindex(ipr, "br-ldn")
+    if idx_br is None:
+        raise RuntimeError("Interface br-ldn not found")
+    _log_netlink("link set relay-br master br-ldn")
+    ipr.link("set", index=idx_relay_br, master=idx_br)
 
     # MAC learning 無効化 — 全フレームをフラッディング
-    run(["bridge", "link", "set", "dev", "relay-br", "learning", "off"])
-    run(["bridge", "link", "set", "dev", "gretap1", "learning", "off"])
+    idx_gretap = _ifindex(ipr, "gretap1")
+    if idx_gretap is None:
+        raise RuntimeError("Interface gretap1 not found")
+    _log_netlink("brport set relay-br learning off; brport set gretap1 learning off")
+    ipr.brport("set", index=idx_relay_br, learning=0)
+    ipr.brport("set", index=idx_gretap, learning=0)
 
     # tc ingress redirect: station IF → relay-sta
-    run(["tc", "qdisc", "add", "dev", ifname, "ingress"])
-    run(
-        [
-            "tc",
-            "filter",
-            "add",
-            "dev",
-            ifname,
-            "parent",
-            "ffff:",
-            "protocol",
-            "all",
-            "u32",
-            "match",
-            "u32",
-            "0",
-            "0",
-            "action",
-            "mirred",
-            "egress",
-            "redirect",
-            "dev",
-            "relay-sta",
-        ]
+    idx_ldn = _ifindex(ipr, ifname)
+    if idx_ldn is None:
+        raise RuntimeError(f"Interface {ifname!r} not found")
+    _log_netlink(
+        f"tc add ingress dev {ifname}; tc add-filter u32 mirred redirect → relay-sta"
+    )
+    ipr.tc("add", "ingress", index=idx_ldn)
+    ipr.tc(
+        "add-filter",
+        "u32",
+        index=idx_ldn,
+        parent=0xFFFF0000,
+        protocol=protocols.ETH_P_ALL,
+        keys=["0x0/0x0+0"],
+        target=TC_H_ROOT,
+        action={
+            "kind": "mirred",
+            "direction": "egress",
+            "action": "redirect",
+            "ifindex": idx_relay_sta,
+        },
     )
 
     # tc ingress redirect: relay-sta → station IF
-    run(["tc", "qdisc", "add", "dev", "relay-sta", "ingress"])
-    run(
-        [
-            "tc",
-            "filter",
-            "add",
-            "dev",
-            "relay-sta",
-            "parent",
-            "ffff:",
-            "protocol",
-            "all",
-            "u32",
-            "match",
-            "u32",
-            "0",
-            "0",
-            "action",
-            "mirred",
-            "egress",
-            "redirect",
-            "dev",
-            ifname,
-        ]
+    _log_netlink(
+        f"tc add ingress dev relay-sta; tc add-filter u32 mirred redirect → {ifname}"
+    )
+    ipr.tc("add", "ingress", index=idx_relay_sta)
+    ipr.tc(
+        "add-filter",
+        "u32",
+        index=idx_relay_sta,
+        parent=0xFFFF0000,
+        protocol=protocols.ETH_P_ALL,
+        keys=["0x0/0x0+0"],
+        target=TC_H_ROOT,
+        action={
+            "kind": "mirred",
+            "direction": "egress",
+            "action": "redirect",
+            "ifindex": idx_ldn,
+        },
     )
 
     # IPv6 無効化
-    run(["sysctl", "-w", "net.ipv6.conf.relay-sta.disable_ipv6=1"])
-    run(["sysctl", "-w", "net.ipv6.conf.relay-br.disable_ipv6=1"])
+    _log_netlink(f"disable_ipv6 {ifname}, relay-sta, relay-br")
+    _disable_ipv6(ifname)
+    _disable_ipv6("relay-sta")
+    _disable_ipv6("relay-br")
 
 
-def teardown_tunnel():
+def teardown_tunnel(ipr: IPRoute):
     """トンネルとリレーを削除する。Primary/Secondary 共用。"""
     print("Cleaning up...")
-    run_quiet(["tc", "qdisc", "del", "dev", "ldn", "ingress"])
-    run_quiet(["ip", "link", "del", "relay-sta"])  # veth peer も自動削除
-    run_quiet(["ip", "link", "del", "br-ldn"])
-    run_quiet(["ip", "link", "del", "gretap1"])
+    # tc ingress qdisc
+    idx = _ifindex(ipr, "ldn")
+    if idx is not None:
+        try:
+            ipr.tc("del", "ingress", index=idx)
+        except NetlinkError:
+            pass
+    # link del (relay-sta 削除で veth peer も自動削除)
+    for ifname in ["relay-sta", "br-ldn", "gretap1"]:
+        idx = _ifindex(ipr, ifname)
+        if idx is not None:
+            try:
+                ipr.link("del", index=idx)
+            except NetlinkError:
+                pass
 
 
-def add_tap_to_bridge():
+def add_tap_to_bridge(ipr: IPRoute):
     """Secondary: TAP を br-ldn に追加する。MAC learning 無効化でフラッディング強制。"""
-    run(["ip", "link", "set", "ldn-tap", "master", "br-ldn"])
-    run(["bridge", "link", "set", "dev", "ldn-tap", "learning", "off"])
-    run(["bridge", "link", "set", "dev", "gretap1", "learning", "off"])
-    run(["sysctl", "-w", "net.ipv6.conf.ldn-tap.disable_ipv6=1"])
+
+    idx_tap = _ifindex(ipr, "ldn-tap")
+    idx_br = _ifindex(ipr, "br-ldn")
+    idx_gretap = _ifindex(ipr, "gretap1")
+    idx_mon = _ifindex(ipr, "ldn-mon")
+    if None in (idx_tap, idx_br, idx_gretap, idx_mon):
+        missing = [
+            n
+            for n, i in [
+                ("ldn-tap", idx_tap),
+                ("br-ldn", idx_br),
+                ("gretap1", idx_gretap),
+                ("ldn-mon", idx_mon),
+            ]
+            if i is None
+        ]
+        raise RuntimeError(f"Interface(s) not found: {', '.join(missing)}")
+
+    _log_netlink("link set ldn-tap master br-ldn")
+    ipr.link("set", index=idx_tap, master=idx_br)
+
+    _log_netlink("brport set ldn-tap learning off; brport set gretap1 learning off")
+    ipr.brport("set", index=idx_tap, learning=0)
+    ipr.brport("set", index=idx_gretap, learning=0)
+
+    _log_netlink("disable_ipv6 ldn-tap")
+    _disable_ipv6("ldn-tap")
+
     # 802.11 フレームは Ethernet より大きい (header 24 + CCMP 8 + SNAP 8 + MIC 8 = +34 bytes)
     # MTU 1500 だと大きい Pia パケットの変換後フレームが EMSGSIZE になる
-    run(["ip", "link", "set", "ldn-mon", "mtu", "2304"])
+    _log_netlink("link set ldn-mon mtu 2304")
+    ipr.link("set", index=idx_mon, mtu=2304)
 
 
 # --- Monkey-patching (Secondary only) ---
 
 
-def patch_secondary_network(network, net_msg):
+def patch_secondary_network(ipr: IPRoute, network, net_msg):
     """Secondary の APNetwork を Switch A のプロキシとしてパッチする。
 
     1. _network_id を Switch A のサブネット ID に統一
@@ -240,19 +307,16 @@ def patch_secondary_network(network, net_msg):
     p0.platform = host["platform"]
 
     # 3. TAP IP を .254 に設定
-    subprocess.run(["ip", "addr", "flush", "dev", "ldn-tap"], check=True)
-    subprocess.run(
-        [
-            "ip",
-            "addr",
-            "add",
-            f"169.254.{network_id}.254/24",
-            "brd",
-            f"169.254.{network_id}.255",
-            "dev",
-            "ldn-tap",
-        ],
-        check=True,
+    idx_tap = _ifindex(ipr, "ldn-tap")
+    if idx_tap is None:
+        raise RuntimeError("Interface ldn-tap not found")
+    ipr.flush_addr(index=idx_tap)
+    ipr.addr(
+        "add",
+        index=idx_tap,
+        address=f"169.254.{network_id}.254",
+        prefixlen=24,
+        broadcast=f"169.254.{network_id}.255",
     )
 
     # 4. _register_participant パッチ (index 0=Switch A 予約, 1-7=Switch B+)
@@ -633,9 +697,9 @@ async def handle_peer_messages_secondary(network, reader):
 # --- Main flows ---
 
 
-async def run_primary(args):
+async def run_primary(ipr: IPRoute, args):
     keys = ldn.load_keys(args.keys)
-    cleanup_stale_interfaces()
+    cleanup_stale_interfaces(ipr)
 
     # 1. Scan (STA 接続はしない — scan 結果から全情報を取得)
     print("=== 1. Scan for MK8DX ===")
@@ -707,7 +771,7 @@ async def run_primary(args):
 
     # 2. GRETAP tunnel + bridge
     print("=== 2. GRETAP tunnel + bridge ===")
-    setup_tunnel(args.local, args.remote)
+    setup_tunnel(ipr, args.local, args.remote)
     print()
 
     try:
@@ -745,7 +809,7 @@ async def run_primary(args):
 
                     # 4. Relay 構築 (Switch B 参加前に完成)
                     print("=== 4. Setting up relay ===")
-                    setup_station_relay()
+                    setup_station_relay(ipr)
                     print()
 
                     # 5. Secondary 待機
@@ -820,16 +884,16 @@ async def run_primary(args):
                 raise
 
     finally:
-        teardown_tunnel()
+        teardown_tunnel(ipr)
 
 
-async def run_secondary(args):
+async def run_secondary(ipr: IPRoute, args):
     keys = ldn.load_keys(args.keys)
-    cleanup_stale_interfaces()
+    cleanup_stale_interfaces(ipr)
 
     # 1. GRETAP + bridge
     print("=== 1. GRETAP tunnel + bridge ===")
-    setup_tunnel(args.local, args.remote)
+    setup_tunnel(ipr, args.local, args.remote)
     print()
 
     try:
@@ -858,10 +922,10 @@ async def run_secondary(args):
 
         async with ldn.create_network(param) as network:
             # 5. Patch: Switch A のプロキシとして構成
-            patch_secondary_network(network, net_msg)
+            patch_secondary_network(ipr, network, net_msg)
 
             # 6. Bridge TAP
-            add_tap_to_bridge()
+            add_tap_to_bridge(ipr)
 
             # 7. Signal ready
             await send_msg(peer_stream, {"type": "ready"})
@@ -879,7 +943,7 @@ async def run_secondary(args):
                 nursery.start_soon(handle_peer_messages_secondary, network, reader)
 
     finally:
-        teardown_tunnel()
+        teardown_tunnel(ipr)
 
 
 async def main():
@@ -904,10 +968,11 @@ async def main():
     )
     args = parser.parse_args()
 
-    if args.role == "primary":
-        await run_primary(args)
-    else:
-        await run_secondary(args)
+    with IPRoute() as ipr:
+        if args.role == "primary":
+            await run_primary(ipr, args)
+        else:
+            await run_secondary(ipr, args)
 
 
 if __name__ == "__main__":
