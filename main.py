@@ -114,7 +114,10 @@ def _link_create(ipr: IPRoute, ifname: str, **kwargs) -> Generator[int, None, No
     try:
         yield idx[0]
     finally:
-        ipr.link("del", index=idx[0])
+        try:
+            ipr.link("del", index=idx[0])
+        except Exception:
+            pass
 
 
 @contextmanager
@@ -153,7 +156,10 @@ def _tc_ingress_redirect(
     try:
         yield
     finally:
-        ipr.tc("del", "ingress", index=src_idx)
+        try:
+            ipr.tc("del", "ingress", index=src_idx)
+        except Exception:
+            pass
 
 
 # --- Network infrastructure ---
