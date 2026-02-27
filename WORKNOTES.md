@@ -1344,3 +1344,337 @@ gre                    12288  1 ip_gre
 - 技術的に有用な情報なし。誰も実際には試していない
 - OpenVPN TAP案はLANモードとLDNの混同に基づく
 - kinnay/LDN以前の議論なので参考価値は低い
+
+### 2026-02-27: USB WiFi アダプタ互換性調査 (ドライバレベル)
+
+Linux カーネルソースを読み、ldn-tunneling の要件を満たす可能性のある USB WiFi ドライバを網羅的に調査した。
+
+**調査対象カーネル:** torvalds/linux @ `a75cb869a8ccc88b0bc7a44e1597d9c7995c56e5`
+
+**ldn-tunneling がドライバに要求する機能:**
+- mac80211 ベース (fullmac 不可) — `CMD_FRAME`, `CMD_REGISTER_FRAME`, `CMD_CONTROL_PORT_FRAME` が mac80211 共通実装に依存するため
+- USB バス対応
+- AP モード (`NL80211_IFTYPE_AP`)
+- Monitor モード — mac80211 がソフトウェアで追加するため `iface_combinations` にはカウントされない。AP が許可されていれば AP + Monitor 同時動作は原理上可能
+- 2.4 GHz ch1/6/11
+
+**判定方法:**
+- mac80211: `ieee80211_alloc_hw()` / `ieee80211_register_hw()` の呼び出し有無
+- USB: `usb_device_id` テーブルの有無
+- インターフェース組合せ: `ieee80211_iface_combination` 構造体の定義内容
+- 2.4 GHz: `NL80211_BAND_2GHZ` 帯域の登録有無
+
+#### 不適合ドライバ
+
+| ドライバ | チップセット | 不適合理由 | 根拠 (ソースパス) |
+|---|---|---|---|
+| ath6kl | AR6003/AR6004 | fullmac (cfg80211 直接) | `ath/ath6kl/cfg80211.c` — `wiphy_new()` 使用、`ieee80211_alloc_hw` なし |
+| mwifiex | 88W8766/8797/8801/8997 | fullmac | `marvell/mwifiex/cfg80211.c:4713` — `wiphy_new()` |
+| brcmfmac | BCM4314x/4323x/4356x 等 | fullmac | `broadcom/brcm80211/brcmfmac/core.c:1313` — `wiphy_new()` |
+| brcmsmac | BCM4313/43224/43225 | USB 非対応 (BCMA/PCIe のみ) | `broadcom/brcm80211/brcmsmac/mac80211_if.c:1313` — `bcma_driver_register()` |
+| mt7601u | MT7601U | STA のみ。AP/Monitor 未対応 | `mediatek/mt7601u/init.c:612` — `interface_modes = BIT(STATION)` |
+| ar5523 | AR5523 | STA のみ。1 VIF 制限 | `ath/ar5523/ar5523.c:1714` — `interface_modes = BIT(STATION)` |
+| libertas_tf | 88W8388 | STA+ADHOC のみ。AP 非対応 | `marvell/libertas_tf/main.c:588` — `interface_modes = BIT(STATION) \| BIT(ADHOC)` |
+| rtl8180 | RTL8180 | PCI 専用 | `realtek/rtl818x/rtl8180/dev.c:1983` — `module_pci_driver()` |
+| rtl8187 | RTL8187/8187B | iface_combination 未定義 (単一 VIF) | `realtek/rtl818x/rtl8187/` — `ieee80211_iface_combination` なし |
+| zd1211rw | ZD1211/ZD1211B | iface_combination 未定義 (単一 VIF) | `zydas/zd1211rw/` — `ieee80211_iface_combination` なし |
+| p54 | ISL3880/3886/3887 | iface_combination 未定義 (単一 VIF) | `intersil/p54/` — `ieee80211_iface_combination` なし |
+
+#### 候補ドライバ
+
+**mt76 ファミリ (MediaTek) — 最有力**
+
+全チップ mac80211 ベース。共通エントリポイント: `mediatek/mt76/mac80211.c:675` (`ieee80211_alloc_hw`), `:785` (`ieee80211_register_hw`)
+
+| チップ (USB) | ドライバ | iface_combination (USB) | 2.4 GHz | 根拠 |
+|---|---|---|---|---|
+| MT7610U | mt76x0u | STA/AP/P2P ≤2, total ≤2, 1ch | Yes | `mt76/mt76x02_util.c` — `mt76x02u_if_limits[]`: max=2, types=STA\|AP\|MESH\|P2P |
+| **MT7612U** | mt76x2u | STA/AP/P2P ≤2, total ≤2, 1ch | Yes | 同上。**A6210 で動作実証済み** |
+| MT7663U | mt7615 | STA/AP/P2P/MESH ≤16, total ≤16, 1ch | Yes | `mt76/mt7615/init.c` — `if_limits[]`: max=16 |
+| MT7921AU | mt792x | STA ≤4 + AP ≤1, 1ch | Yes | `mt76/mt792x_core.c` — `if_limits[]`: STA max=4, AP max=1 |
+| MT7925U | mt792x | STA ≤4 + AP ≤1, 1ch | Yes | 同上 (mt7921 と共通コード) |
+
+**Atheros**
+
+| チップ (USB) | ドライバ | iface_combination | 2.4 GHz | 根拠 |
+|---|---|---|---|---|
+| AR9271 | ath9k_htc | STA/P2P-CL ≤2, AP/P2P-GO ≤2, total ≤2, 1ch | Yes (専用) | `ath/ath9k/htc_drv_init.c:695-710` |
+| AR7010+AR9280 | ath9k_htc | 同上 | Yes (dual) | 同上。UB94 |
+| AR7010+AR9287 | ath9k_htc | 同上 | Yes (専用) | 同上。UB95 |
+| AR9170 | carl9170 | types ≤fw.vif_num (通常2), 1ch | Yes | `ath/carl9170/fw.c:205-220`。AP は FW の beacon DMA + WLANTX_CAB 対応が条件 (`fw.c:338-347`) |
+
+**Ralink**
+
+| チップ (USB) | ドライバ | iface_combination | 2.4 GHz | 根拠 |
+|---|---|---|---|---|
+| RT3070/3572/5370/5572 等 | rt2800usb | AP ≤8 (AP のみ組合せ), 1ch | Yes | `ralink/rt2x00/rt2x00dev.c:1337-1357` — AP 型のみの組合せ。STA は組合せに含まれないが、Secondary 役 (AP+Monitor) には支障なし |
+
+**Realtek**
+
+| チップ (USB) | ドライバ | iface_combination | 2.4 GHz | 根拠 |
+|---|---|---|---|---|
+| RTL8822CU | rtw88 | STA ≤1 + AP ≤1, total ≤2, 1ch | Yes | `realtek/rtw88/main.c:107-125`。**RTL8822C のみ** — `main.c:2293` で chip ID を条件判定 |
+| RTL8851BU | rtw89 | STA ≤1 + AP/P2P ≤1, total ≤2, 1ch | Yes | `realtek/rtw89/core.c:167-205` |
+| RTL8852AU | rtw89 | 同上 | Yes | 同上 |
+| RTL8852BU | rtw89 | 同上 + MCC (2ch, P2P のみ) | Yes | 同上。`support_chanctx_num=2` |
+| RTL8852CU | rtw89 | 同上 + MCC | Yes | 同上 |
+| RTL8188FU | rtl8xxxu | STA ≤2 + AP ≤1, total ≤2, 1ch | Yes (専用) | `realtek/rtl8xxxu/core.c:7677-7689`。**RTL8188FU のみ** — `8188f.c:1754` で `supports_concurrent=1` |
+
+**その他**
+
+| チップ (USB) | ドライバ | iface_combination | 2.4 GHz | 根拠 |
+|---|---|---|---|---|
+| RS9113/RS9116 | rsi | STA ≤1 + AP/P2P ≤1 + P2P-DEV ≤1, total ≤3, 1ch | Yes | `rsi/rsi_91x_mac80211.c:143-167` |
+
+#### 注意事項
+
+- **ドライバレベルの対応は必要条件であって十分条件ではない。** ELECOM WDC-867SU3SBK (MT7612U) で実証済み: チップとドライバは対応していても、製品の RF フロントエンド (2.4 GHz PA 未搭載) により使用不可となる場合がある
+- Monitor モードは mac80211 がソフトウェアで追加するため、`iface_combinations` に明示されていなくても利用可能。ただし AF_PACKET 経由のフレームインジェクション (TX) が正常に動作するかはドライバの TX パス実装に依存し、ソースコード上の `iface_combinations` からは判定できない
+- Realtek の mac80211 ドライバ (rtw88/rtw89/rtl8xxxu) は比較的新しく、フレームインジェクション等の低レベル機能の成熟度は mt76/ath9k に比べて未知数
+
+### 2026-02-27: チップ別 一般入手可能な USB WiFi アダプタ製品調査
+
+前項のドライバ互換性調査結果に基づき、各候補チップセットに対応する市販 USB WiFi アダプタ製品を網羅的に調査した。
+カーネル USB デバイス ID テーブル (`usb_device_id`) と Web 検索を照合して製品を特定。
+
+#### mt76 ファミリ (MediaTek) — 動作実証済みドライバ
+
+**MT7612U (mt76x2u) — A6210 で動作実証済み**
+
+カーネルテーブル: `mediatek/mt76/mt76x2/usb.c`
+
+| 製品 | メーカー | USB VID:PID | 価格帯 | 入手性 |
+|---|---|---|---|---|
+| Netgear A6210 | Netgear | 0846:9053 | ~$25-50 | Amazon, Walmart | 動作実証済み |
+| Alfa AWUS036ACM | Alfa Network | 0e8d:7612 | ~$47 | Amazon, Rokland |
+| Panda PAU0D | Panda Wireless | (shared) | ~$30-60 | Amazon |
+| Panda PAU0C | Panda Wireless | (shared) | ~$25-35 | Amazon |
+| ASUS USB-AC55 B1 | ASUS | 0b05:17eb | ~$30-50 | Amazon (在庫限り) |
+| COMFAST CF-WU782AC v2 | COMFAST | — | ~$13-20 | AliExpress |
+| EDUP EP-AC1601 | EDUP | 0e8d:7612 | ~$10-20 | eBay |
+| The Pi Hut MT7612U | OEM | — | ~£14 | thepihut.com |
+| AVM FRITZ!WLAN AC 860 | AVM | 057c:8503 | ~€25-40 | Amazon.de (MT7662U、同ドライバ) |
+| TP-Link TL-WDN6200 | TP-Link | 2357:0137 | ~$30 | 中国市場中心 |
+| ELECOM WDC-867SU3SBK | ELECOM | 056e:400a | — | **使用不可 (2.4GHz PA 未搭載)** |
+
+**MT7610U (mt76x0u) — AC600**
+
+カーネルテーブル: `mediatek/mt76/mt76x0/usb.c` (25エントリ)
+
+| 製品 | メーカー | USB VID:PID | 価格帯 | 入手性 | 備考 |
+|---|---|---|---|---|---|
+| Alfa AWUS036ACHM | Alfa Network | — | ~$35-40 | Amazon, Rokland | 外部 RP-SMA |
+| Panda PAU0A / PAU0B | Panda Wireless | — | ~$20-30 | Amazon | A=ナノ, B=外部アンテナ |
+| Edimax EW-7811UTC | Edimax | 7392:b711 | ~$15-20 | Amazon, Newegg | |
+| TP-Link Archer T2U/T2UH | TP-Link | 148f:761a | ~$15-25 | Amazon | |
+| D-Link DWA-171 rev B1 | D-Link | 2001:3d02 | ~$20 | Amazon | **rev A1 は RTL8811AU で不適合** |
+| AVM FRITZ!WLAN AC 430 | AVM | 057c:8502 | ~€40 | Amazon.de | |
+| TP-Link Archer T1U | TP-Link | 2357:0105 | ~$20 | Amazon | **5GHz 専用 (カーネルで no_2ghz=true)** |
+
+**MT7921AU (mt792x) — Wi-Fi 6, 現行入手最容易**
+
+カーネルテーブル: `mediatek/mt76/mt7921/usb.c` (5エントリ + VID:PID 0e8d:7961 共有多数)
+
+| 製品 | メーカー | USB VID:PID | 価格帯 | 入手性 | 備考 |
+|---|---|---|---|---|---|
+| Alfa AWUS036AXML | Alfa Network | 0e8d:7961 | ~$70-77 | Amazon, Rokland | AXE3000 tri-band, RP-SMA |
+| TP-Link Archer TXE50UH | TP-Link | 35bc:0107 | ~$55 | Amazon, Newegg | AXE3000 |
+| Netgear A8000 | Netgear | 0846:9060 | ~$70 | Amazon, Best Buy | AXE3000 |
+| Netgear A7500 | Netgear | 0846:9065 | ~$49 | Amazon, Best Buy | AX1800 (6GHz なし) |
+| BrosTrend AX9L | BrosTrend | 0e8d:7961 | ~$34-35 | Amazon | Linux 専用マーケティング |
+| Panda PAU0F | Panda Wireless | 0e8d:7961 | ~$30 | Amazon | AXE3000 |
+| EDUP EP-AX1672 | EDUP | 0e8d:7961 | ~$16-26 | Amazon | AXE3000, コスパ良 |
+| Comfast CF-951AX | Comfast | 0e8d:7961 | ~$13 | AliExpress | AX1800, 最安価帯 |
+
+**MT7925U (mt792x) — Wi-Fi 7**
+
+カーネルテーブル: `mediatek/mt76/mt7925/usb.c` (2エントリ)
+
+| 製品 | メーカー | USB VID:PID | 価格帯 | 入手性 |
+|---|---|---|---|---|
+| Netgear A9000 | Netgear | 0846:9072 | ~$90-100 | Amazon, Best Buy | カーネル 6.7+。現時点で唯一の市販品 |
+
+**MT7663U (mt7615) — iface_combination 最大 16 だが製品なし**
+
+カーネルテーブルに 2 エントリのみ。LG LGSBWAC02 (TV 内蔵モジュール) のスペアパーツ以外に一般向け USB ドングルなし。候補外。
+
+#### Atheros
+
+**AR9271 (ath9k_htc) — 2.4GHz 専用, 802.11n**
+
+カーネルテーブル: `ath/ath9k/hif_usb.c`
+
+| 製品 | メーカー | 価格帯 | 入手性 | 備考 |
+|---|---|---|---|---|
+| Generic AR9271 | 中国 OEM 各社 | ~$10-15 | AliExpress | 現在も生産中 |
+| Deal4GO AR9271 | Deal4GO | ~$10-20 | Amazon | |
+| TP-Link TL-WN722N v1 | TP-Link | ~$15-50 | eBay | **v2/v3 は Realtek で不適合。要確認** |
+| Alfa AWUS036NHA | Alfa Network | ~$30-45 | Amazon (3rd party) | EOL |
+
+**AR7010+AR9280 (ath9k_htc) — デュアルバンド, 802.11n**
+
+| 製品 | メーカー | 価格帯 | 入手性 |
+|---|---|---|---|
+| Netgear WNDA3200 | Netgear | ~$10-25 | eBay (中古) |
+| Sony UWA-BR100 | Sony | ~$15-35 | eBay (中古) |
+
+**AR9170 (carl9170) — 全製品ディスコン**
+
+| 製品 | メーカー | 価格帯 | 入手性 |
+|---|---|---|---|
+| D-Link DWA-160 A1/A2 | D-Link | ~$10-25 | eBay (中古) |
+| Netgear WNDA3100 v1 | Netgear | ~$10-20 | eBay (中古)。**v2 は Broadcom で不適合** |
+
+#### Ralink/MediaTek (rt2800usb)
+
+カーネルテーブル: `ralink/rt2x00/rt2800usb.c` (200 超エントリ)
+
+| 製品 | チップ | 価格帯 | 入手性 | 備考 |
+|---|---|---|---|---|
+| Deal4GO RT5572 | RT5572 | ~$8-12 | Amazon | デュアルバンド 300Mbps |
+| Generic RT5370 nano | RT5370 | ~$3-15 | AliExpress | 2.4GHz 専用。大量生産品 |
+| Hak5 RT5370 | RT5370 | ~$15 | shop.hak5.org | |
+| Deal4GO RT3070 各種 | RT3070 | ~$10-18 | Amazon | 2.4GHz 専用 |
+
+注: rt2800usb の iface_combination は AP のみの組合せ定義。STA+AP 同時は未定義。
+
+#### Realtek (rtw88 / rtw89)
+
+**rtw89 ドライバ — カーネル 6.17+ で USB サポート統合**
+
+RTL8852BU (最も製品豊富):
+
+| 製品 | メーカー | USB VID:PID | 価格帯 | 入手性 |
+|---|---|---|---|---|
+| TP-Link Archer TX20U Nano | TP-Link | 35bc:0108 | ~$20-30 | Amazon, Newegg |
+| TP-Link Archer TX20U | TP-Link | 35bc:0100 | ~$25-40 | Amazon |
+| Edimax EW-7822UMX | Edimax | 7392:6822 | ~$35-45 | Amazon, Newegg |
+| MSI AX1800 (GUAX18) | MSI | 0db0:6931 | ~$35-50 | Amazon, Newegg |
+| BrosTrend AX4L | BrosTrend | — | ~$30-35 | Amazon |
+
+RTL8852AU:
+
+| 製品 | メーカー | USB VID:PID | 価格帯 | 入手性 |
+|---|---|---|---|---|
+| ASUS USB-AX56 | ASUS | 0b05:1997 | ~$50-70 | Amazon, Best Buy |
+| D-Link DWA-X1850 | D-Link | 2001:3321 | ~$40-60 | Amazon, Best Buy |
+| TP-Link Archer TX20U Plus | TP-Link | 2357:013f | ~$25-40 | Amazon |
+
+RTL8852CU (Wi-Fi 6E):
+
+| 製品 | メーカー | USB VID:PID | 価格帯 | 入手性 |
+|---|---|---|---|---|
+| MSI AXE5400 (GUAXE54) | MSI | 0db0:991d | ~$49-65 | Amazon, Best Buy |
+| TP-Link Archer TXE70UH | TP-Link | 35bc:0102 | ~$60-80 | Amazon, Newegg |
+
+RTL8851BU:
+
+| 製品 | メーカー | USB VID:PID | 価格帯 | 入手性 |
+|---|---|---|---|---|
+| TP-Link Archer TX10UB Nano | TP-Link | 3625:010b | ~$20-30 | Amazon, Best Buy |
+| Edimax EW-7611UXB | Edimax | 7392:e611 | ~$20-30 | Amazon |
+| D-Link AX9U | D-Link | 2001:332a | ~$20-30 | D-Link 公式 |
+
+RTL8822CU (rtw88 — このチップのみ対応):
+
+| 製品 | メーカー | USB VID:PID | 価格帯 | 入手性 |
+|---|---|---|---|---|
+| D-Link DWA-182 rev D | D-Link | 2001:3329 | ~$20-35 | Amazon |
+| Linksys WUSB6400M | Linksys | 13b1:0043 | ~$30-50 | Amazon |
+
+**RTL8188FU (rtl8xxxu) / RSI 91x — 実用候補外**
+
+- RTL8188FU: ノーブランド 150Mbps ナノドングルのみ (~$5-15)
+- RS9113/RS9116: 一般向け USB ドングル製品なし。開発ボード (~$100) のみ
+
+#### リビジョン問題の警告
+
+同一型番でもハードウェアリビジョンによりチップセットが異なる製品が複数存在する:
+
+| 製品 | 適合リビジョン (チップ) | 不適合リビジョン (チップ) |
+|---|---|---|
+| TP-Link TL-WN722N | v1 (AR9271) | v2, v3 (Realtek) |
+| TP-Link Archer T2U | v1 (MT7610U) | v3 (RTL8811AU) |
+| D-Link DWA-171 | rev B1 (MT7610U) | rev A1 (RTL8811AU) |
+| Netgear WNDA3100 | v1 (AR9170), v3 (MT7632U) | v2 (Broadcom) |
+| D-Link DWA-160 | A1, A2 (AR9170) | 後期リビジョン (不明) |
+
+購入時は必ずリビジョンを確認すること。
+
+### 2026-02-27: rtw89 ドライバ Monitor モード TX フレームインジェクション対応調査
+
+ldn-tunneling は LDN ライブラリの `Monitor` クラス (`ldn/wlan.py`) で AF_PACKET SOCK_RAW 経由のフレームインジェクション (TX) を使用している。具体的には:
+
+- `APNetwork._send_advertisement()` — LDN ネットワーク Advertisement フレームのブロードキャスト
+- `APNetwork._send_data_frame()` — Ethernet フレームを 802.11 形式に変換して送信
+
+いずれも Secondary (AP) 役で Monitor モードインターフェース上の `socket.send()` による生フレームインジェクション。この機能はドライバの TX パス実装に依存するため、rtw89 ドライバのカーネルソースを直接調査した。
+
+**調査対象:** `u1f992-temp/linux` (`drivers/net/wireless/realtek/rtw89/`)
+
+#### 結論: rtw89 は Monitor モード TX フレームインジェクションを明示的にサポートしている
+
+**根拠 1: `WANT_MONITOR_VIF` の設定**
+
+`drivers/net/wireless/realtek/rtw89/core.c:6609`:
+```c
+ieee80211_hw_set(hw, WANT_MONITOR_VIF);
+```
+
+これにより mac80211 が内部仮想 Monitor VIF を作成し、`drv_add_interface()` を呼び出す。`rtw89_ops_add_interface()` (`mac80211.c:166`) はこの Monitor VIF を正しく初期化し、`dlink_pool` にリンクを追加する。
+
+**根拠 2: `IEEE80211_TX_CTL_INJECTED` の明示的チェック**
+
+`drivers/net/wireless/realtek/rtw89/core.c:1265-1266`:
+```c
+if (unlikely(info->flags & IEEE80211_TX_CTL_INJECTED))
+    rtw89_core_tx_update_injection(rtwdev, tx_req, info);
+```
+
+インジェクションフラグを明示的に検出し、専用のハンドラに振り分けている。
+
+**根拠 3: 専用インジェクション処理関数**
+
+`drivers/net/wireless/realtek/rtw89/core.c:1166-1202` に `rtw89_core_tx_update_injection()` が存在:
+- `use_rate = true`, `dis_data_fb = true` (レートフォールバック無効化) を設定し、ユーザー指定レートを尊重
+- `info->control.rates[0]` から radiotap ヘッダ由来の MCS/VHT/レガシーレートインデックスを解析
+- 帯域幅 (160/80/40 MHz) および Short GI 設定を処理
+- レートインデックスをハードウェア固有定数 (`RTW89_HW_RATE_CCK1`, `RTW89_HW_RATE_OFDM6`, HT/VHT レート) にマッピング
+
+**根拠 4: TX パスに Monitor ブロックなし**
+
+- `rtw89_ops_tx()` (`mac80211.c:19-46`) — `vif->type` チェックなし、Monitor VIF でもドロップしない
+- `rtw89_core_tx_write()` (`core.c:1393-1418`) — インターフェースタイプチェックなし
+- `rtw89_core_tx_write_link()` (`core.c:1354-1391`) — インターフェースタイプチェックなし
+
+#### mt76 との比較
+
+| 機能 | rtw89 | mt76 |
+|---|---|---|
+| `WANT_MONITOR_VIF` | あり (`core.c:6609`) | あり (`mt792x_core.c:686`, `mt7615/init.c:405`) |
+| `NL80211_IFTYPE_MONITOR` in `interface_modes` | なし (mac80211 がソフトウェアで追加) | なし (同上) |
+| `IEEE80211_TX_CTL_INJECTED` 明示処理 | **あり** (`core.c:1265-1266`, 専用関数) | なし (汎用パスで処理) |
+| Radiotap ヘッダからのレート解析 | あり (`rtw89_core_tx_update_injection`) | なし (`ieee80211_get_tx_rates` に委任) |
+
+rtw89 は mt76 よりも洗練されたインジェクションサポートを持つ。
+
+#### 制限事項
+
+- HE/EHT レートでのインジェクションは未対応 (CCK/OFDM/HT/VHT のみ)。ldn-tunneling は 2.4 GHz の低レートを使用するため問題なし
+- rtw88 ドライバは `WANT_MONITOR_VIF` 未設定、`interface_modes` に MONITOR なし。Monitor モード自体が未対応
+
+#### ldn-tunneling 適合性判定の更新
+
+rtw89 対応チップは Monitor TX インジェクションをドライバレベルで明示サポートしているため、「要検証」から「適合 (ドライバレベル)」に更新する。ただし RF フロントエンドの 2.4 GHz 対応は製品依存 (ELECOM WDC-867SU3SBK の前例あり)。
+
+| チップ (USB) | ドライバ | iface_combination | Monitor TX | 判定 |
+|---|---|---|---|---|
+| RTL8851BU | rtw89 | STA ≤1 + AP/P2P ≤1, 1ch | 明示サポート | **適合** |
+| RTL8852AU | rtw89 | STA ≤1 + AP/P2P ≤1, 1ch | 明示サポート | **適合** |
+| RTL8852BU | rtw89 | STA ≤1 + AP/P2P ≤1, 1ch | 明示サポート | **適合** |
+| RTL8852CU | rtw89 | STA ≤1 + AP/P2P ≤1, 1ch | 明示サポート | **適合** |
+
+日本市場で入手可能な候補:
+- **TP-Link Archer TX20U / TX20U Nano** (RTL8852BU) — tp-link.com/jp にラインナップあり
+- **TP-Link Archer TX10UB Nano** (RTL8851BU) — tp-link.com/jp にラインナップあり
+- **TP-Link Archer TXE70UH** (RTL8852CU) — tp-link.com/jp にラインナップあり
