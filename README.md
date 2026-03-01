@@ -1,6 +1,13 @@
 # ldn-tunneling
 
-Bridge Nintendo Switch LDN sessions across the internet using MAC-spoofed STA relay (proof of concept)
+Bridge Nintendo Switch LDN sessions across the internet using MAC-spoofed STA relay (proof of concept).
+
+The relayed LDN network is a real Wi-Fi session, so **OFW (stock firmware) consoles can join as-is** -- no CFW or modifications are needed on the participating Switch. However, two things must be prepared in advance:
+
+1. **`prod.keys`** -- console key material, needed to decrypt and construct the encrypted LDN protocol frames (advertisements, authentication, data).
+2. **LDN passphrase** -- a per-game 64-byte secret embedded in each title. Some games have [known passphrases](https://github.com/kinnay/NintendoClients/wiki/LDN-Passphrases); for the rest, you can extract them by logging the IPC calls inside an emulator:
+   - [`ryujinx-ldn-log-passphrase.patch`](ryujinx-ldn-log-passphrase.patch) -- for Ryujinx (C#/.NET)
+   - [`eden-ldn-log-passphrase.patch`](eden-ldn-log-passphrase.patch) -- for Eden (C++)
 
 ## Setup
 
