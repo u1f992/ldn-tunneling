@@ -9,6 +9,23 @@ The relayed LDN network is a real Wi-Fi session, so **OFW (stock firmware) conso
    - [`ryujinx-ldn-log-passphrase.patch`](ryujinx-ldn-log-passphrase.patch) -- for Ryujinx (C#/.NET)
    - [`eden-ldn-log-passphrase.patch`](eden-ldn-log-passphrase.patch) -- for Eden (C++)
 
+## Tested interfaces
+
+A mac80211-based USB Wi-Fi adapter is required. The Secondary role additionally needs working monitor-mode TX injection (AF_PACKET `SOCK_RAW`), which limits the choice of drivers.
+
+| Adapter | Chipset | Driver | Primary | Secondary | Availability |
+|---|---|---|---|---|---|
+| Netgear A6210 | MT7612U | mt76x2u | OK | OK | Discontinued; second-hand only |
+| TP-Link Archer TX10UB Nano | RTL8851BU | rtw89 | OK | NG (TX injection silent-drops) | In production |
+| TP-Link Archer TX20U Nano | RTL8832BU | rtw89 | OK | NG (TX injection silent-drops) | In production |
+
+If you only need the Primary role, the widely available rtw89-based adapters work fine. For the Secondary role, an mt76x2u-based adapter (e.g. A6210 / MT7612U) is currently the only verified option.
+
+**Note on Netgear A8000 (MT7921AU):** Although the A8000 is the successor to the A6210 and uses the same mt76 driver family (mt7921u), it has known monitor-mode TX injection bugs as of kernel 6.17 ([^gh-usbwifi-387], [^gh-mt76-839]). The hardware is capable in principle, but the driver issues currently prevent it from working for the Secondary role.
+
+[^gh-usbwifi-387]: https://github.com/morrownr/USB-WiFi/issues/387
+[^gh-mt76-839]: https://github.com/openwrt/mt76/issues/839
+
 ## Setup
 
 ```shellsession
@@ -51,4 +68,12 @@ $ .venv/bin/python main.py prod.keys --role primary --local 10.8.0.1 --remote 10
 
 $ # Secondary
 $ .venv/bin/python main.py prod.keys --role secondary --local 10.8.0.2 --remote 10.8.0.1 --phy phy1 --ldn-passphrase mk8dx.bin
+```
+
+## Cleanup
+
+If the process is killed ungracefully (e.g. `kill -9`, SSH disconnect), virtual interfaces may be left behind. The next run cleans them up automatically, but you can also do it manually:
+
+```shellsession
+$ .venv/bin/python -c "from pyroute2 import IPRoute; import main; ipr = IPRoute(); main.cleanup_stale_interfaces(ipr); ipr.close()"
 ```

@@ -1612,7 +1612,7 @@ ldn-tunneling は LDN ライブラリの `Monitor` クラス (`ldn/wlan.py`) で
 
 **調査対象:** `u1f992-temp/linux` (`drivers/net/wireless/realtek/rtw89/`)
 
-#### 結論: rtw89 は Monitor モード TX フレームインジェクションを明示的にサポートしている
+#### コード分析の結論: rtw89 は Monitor モード TX フレームインジェクションを明示的にサポートしている (コード上)
 
 **根拠 1: `WANT_MONITOR_VIF` の設定**
 
@@ -1656,25 +1656,81 @@ if (unlikely(info->flags & IEEE80211_TX_CTL_INJECTED))
 | `IEEE80211_TX_CTL_INJECTED` 明示処理 | **あり** (`core.c:1265-1266`, 専用関数) | なし (汎用パスで処理) |
 | Radiotap ヘッダからのレート解析 | あり (`rtw89_core_tx_update_injection`) | なし (`ieee80211_get_tx_rates` に委任) |
 
-rtw89 は mt76 よりも洗練されたインジェクションサポートを持つ。
+コード上は rtw89 は mt76 よりも洗練されたインジェクションサポートを持つように見える。
 
 #### 制限事項
 
 - HE/EHT レートでのインジェクションは未対応 (CCK/OFDM/HT/VHT のみ)。ldn-tunneling は 2.4 GHz の低レートを使用するため問題なし
 - rtw88 ドライバは `WANT_MONITOR_VIF` 未設定、`interface_modes` に MONITOR なし。Monitor モード自体が未対応
 
-#### ldn-tunneling 適合性判定の更新
+### 2026-03-01: rtw89 実機テスト — Monitor TX インジェクション不動作の確認
 
-rtw89 対応チップは Monitor TX インジェクションをドライバレベルで明示サポートしているため、「要検証」から「適合 (ドライバレベル)」に更新する。ただし RF フロントエンドの 2.4 GHz 対応は製品依存 (ELECOM WDC-867SU3SBK の前例あり)。
+コード分析では rtw89 が Monitor TX インジェクションを明示サポートしていると結論したが、**実機テストで不動作が確認された。**
 
-| チップ (USB) | ドライバ | iface_combination | Monitor TX | 判定 |
+#### テスト環境
+
+- カーネル: 6.17.0-14-generic
+- テスト製品 1: TP-Link Archer TX10UB Nano (RTL8851BU, rtw89_8851bu, FW v0.29.41.3)
+- テスト製品 2: TP-Link Archer TX20U Nano (RTL8832BU, rtw89_8832bu)
+- 比較対象: Netgear A6210 (MT7612U, mt76x2u) — 動作実証済み
+
+#### テスト結果
+
+**Primary (STA) 役 — 両製品とも成功**
+
+- TX10UB Nano (RTL8851BU): CMD_CONNECT で Switch A の LDN AP にアソシエーションし、トンネル経由でセカンダリ (A6210) と通信確立。nl80211 コマンド (mac80211 共通実装) は正常動作。
+- TX20U Nano (RTL8832BU): 同様に成功。セカンダリ (A6210) との組み合わせで安定した双方向通信を確認。tc mirred によるリレーパスも正常動作。
+
+Primary テスト時のインターフェース統計 (TX20U Nano):
+
+| インターフェース | RX (packets) | TX (packets) |
+|---|---|---|
+| ldn (STA → Switch A) | 2824 | 843 |
+| gretap1 | 822 | 2877 |
+| relay-sta / relay-br | 正常にリレー動作 |
+
+※ 初回テスト時に Primary が不安定に見えた原因は、前回の ungraceful kill で残存していたスタンインターフェイス (ldn, gretap1, br-ldn, relay-sta, relay-br) であった。両ホストでクリーンアップ後、安定動作を確認。
+
+**Secondary (AP + Monitor TX) 役 — 両製品とも失敗**
+
+Switch B はセカンダリの AP を発見しアソシエーション (SECONDARY JOIN) するが、直後に切断 (SECONDARY LEAVE) を繰り返す。スタンインターフェイスのクリーンアップ後に TX10UB Nano で再テストしたが結果は同一。
+
+`ldn-mon` インターフェース統計:
+
+| 製品 | ldn-mon RX (packets) | ldn-mon TX (packets) |
+|---|---|---|
+| TX10UB Nano (RTL8851BU) | 1739 | **0** |
+| TX20U Nano (RTL8832BU) | 3943 | **0** |
+| A6210 (MT7612U) | — | 正常動作 (実証済み) |
+
+Monitor モードの RX (キャプチャ) は正常だが、**AF_PACKET 経由の TX (フレームインジェクション) が一切送出されていない。** `socket.send()` はエラーなく返るが、フレームは電波に乗らない。
+
+#### 原因分析
+
+2製品 (RTL8851BU, RTL8832BU) で同一の結果であり、チップ/ファームウェア固有の問題ではなく **rtw89 ドライバ共通コードの問題**。`rtw89_core_tx_update_injection()` はコード上存在するが、以下のいずれかが原因で実際にはフレームが送出されない:
+
+- mac80211 レイヤーで AP + Monitor 同時動作時のチャネルコンテキスト処理によりフレームが破棄されている
+- ドライバが TX キューに投入するがファームウェアが injected フレームを処理しない
+- radiotap ヘッダのレート指定と `rtw89_core_tx_update_injection()` の想定の不一致
+- その他の未特定の原因
+
+**コード上の実装が存在することは、実機で動作することの十分条件ではない。**
+
+#### ldn-tunneling 適合性判定の訂正
+
+rtw89 対応チップの判定を「適合」から訂正する。
+
+| チップ (USB) | ドライバ | Primary (STA) | Secondary (AP + Monitor TX) | 判定 |
 |---|---|---|---|---|
-| RTL8851BU | rtw89 | STA ≤1 + AP/P2P ≤1, 1ch | 明示サポート | **適合** |
-| RTL8852AU | rtw89 | STA ≤1 + AP/P2P ≤1, 1ch | 明示サポート | **適合** |
-| RTL8852BU | rtw89 | STA ≤1 + AP/P2P ≤1, 1ch | 明示サポート | **適合** |
-| RTL8852CU | rtw89 | STA ≤1 + AP/P2P ≤1, 1ch | 明示サポート | **適合** |
+| RTL8851BU | rtw89 | **動作確認済** | **不動作** (TX=0, 再現確認済) | Primary 専用 |
+| RTL8832BU | rtw89 | **動作確認済** | **不動作** (TX=0) | Primary 専用 |
+| RTL8852AU | rtw89 | 未テスト (動作すると推定) | 未テスト (同一コードパスのため不動作と推定) | Primary 専用 (推定) |
+| RTL8852BU | rtw89 | 未テスト (同上) | 未テスト (同上) | Primary 専用 (推定) |
+| RTL8852CU | rtw89 | 未テスト (同上) | 未テスト (同上) | Primary 専用 (推定) |
 
-日本市場で入手可能な候補:
-- **TP-Link Archer TX20U / TX20U Nano** (RTL8852BU) — tp-link.com/jp にラインナップあり
-- **TP-Link Archer TX10UB Nano** (RTL8851BU) — tp-link.com/jp にラインナップあり
-- **TP-Link Archer TXE70UH** (RTL8852CU) — tp-link.com/jp にラインナップあり
+#### 教訓
+
+- ドライバのソースコード分析だけでは Monitor TX インジェクションの動作を保証できない
+- `iface_combinations` と `WANT_MONITOR_VIF` の確認は必要条件だが十分条件ではない
+- 実機テスト (特に `ldn-mon` の TX パケットカウンタ確認) が不可欠
+- mt76 ファミリが引き続き ldn-tunneling の Secondary 役に必要な唯一の実証済みドライバ
