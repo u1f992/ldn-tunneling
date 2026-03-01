@@ -1,0 +1,254 @@
+# LDN Passphrase Logger
+#
+# Logs the game's LDN passphrase (SecurityConfig.passphrase) when the game
+# calls CreateNetwork (IPC cmd 202/203) or Connect (IPC cmd 302/303).
+# Also adds comprehensive tracing to the entire LDN communication flow:
+# Initialize, state transitions, Scan, and packet send/receive.
+#
+# Based on: eden-emu/eden stable @ 2991bd18ef
+#
+# Usage:
+#   1. git clone https://git.eden-emu.dev/eden-emu/eden.git && cd eden
+#      (If HEAD has moved past 2991bd18ef, verify the patch still applies cleanly: git apply --check eden-ldn-log-passphrase.patch)
+#   2. git apply eden-ldn-log-passphrase.patch
+#
+# How to build (Ubuntu 24.04):
+#   apt-get install autoconf cmake g++ gcc git glslang-tools libglu1-mesa-dev \
+#       libhidapi-dev libpulse-dev libtool libudev-dev libxcb-icccm4 libxcb-image0 \
+#       libxcb-keysyms1 libxcb-render-util0 libxcb-xinerama0 libxcb-xkb1 libxext-dev \
+#       libxkbcommon-x11-0 mesa-common-dev nasm ninja-build qt6-base-private-dev catch2 \
+#       libfmt-dev liblz4-dev nlohmann-json3-dev libzstd-dev libssl-dev libavfilter-dev \
+#       libavcodec-dev libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
+#       qt6-tools-dev qt6-charts-dev libvulkan-dev spirv-tools spirv-headers \
+#       libusb-1.0-0-dev libboost-dev libboost-fiber-dev libboost-context-dev \
+#       libsdl2-dev libopus-dev libasound2-dev vulkan-utility-libraries-dev python3 jq patch
+#
+#   cmake -S . -B build -G Ninja \
+#       -DCMAKE_BUILD_TYPE=Release \
+#       -DYUZU_TESTS=OFF \
+#       -DENABLE_QT=ON \
+#       -DENABLE_WEB_SERVICE=OFF \
+#       -DUSE_DISCORD_PRESENCE=OFF \
+#       -DVulkanHeaders_FORCE_BUNDLED=ON \
+#       -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
+#
+#   cmake --build build
+#
+# Runtime dependencies (Ubuntu 24.04):
+#   apt-get install libqt6charts6 libqt6core6t64 libqt6dbus6t64 libqt6gui6t64 \
+#       libqt6opengl6t64 libqt6openglwidgets6t64 libqt6widgets6t64 \
+#       libsdl2-2.0-0 libfmt9 libboost-context1.83.0 \
+#       libavcodec60 libavutil58 libswresample4 \
+#       libssl3t64 libusb-1.0-0 libopus0 liblz4-1 libzstd1 \
+#       libva2 libvdpau1
+#
+#   4. Launch a game and start the LDN hosting (in-game menu)
+#   5. Check ~/.local/share/eden/log/eden_log.txt for "passphrase=" entries
+#
+# No opposite Switch/device is needed — the passphrase is captured at the
+# IPC boundary before any network operation occurs.
+#
+# Output binary: build/bin/eden
+#
+diff --git a/src/core/hle/service/ldn/lan_discovery.cpp b/src/core/hle/service/ldn/lan_discovery.cpp
+index f37dbe492f..a129fdc09e 100644
+--- a/src/core/hle/service/ldn/lan_discovery.cpp
++++ b/src/core/hle/service/ldn/lan_discovery.cpp
+@@ -73,6 +73,8 @@ State LANDiscovery::GetState() const {
+ }
+ 
+ void LANDiscovery::SetState(State new_state) {
++    LOG_INFO(Service_LDN, "State transition: {} -> {}", static_cast<int>(state),
++             static_cast<int>(new_state));
+     state = new_state;
+ }
+ 
+@@ -116,10 +118,11 @@ Result LANDiscovery::Scan(std::span<NetworkInfo> out_networks, s16& out_count,
+         SendBroadcast(Network::LDNPacketType::Scan);
+     }
+ 
+-    LOG_INFO(Service_LDN, "Waiting for scan replies");
++    LOG_INFO(Service_LDN, "Scan: waiting for scan replies, state={}", static_cast<int>(state));
+     std::this_thread::sleep_for(std::chrono::seconds(1));
+ 
+     std::scoped_lock lock{packet_mutex};
++    LOG_INFO(Service_LDN, "Scan: got {} results", scan_results.size());
+     for (const auto& [key, info] : scan_results) {
+         if (out_count >= static_cast<s16>(out_networks.size())) {
+             break;
+@@ -236,7 +239,15 @@ Result LANDiscovery::CreateNetwork(const SecurityConfig& security_config,
+                                    const NetworkConfig& network_config) {
+     std::scoped_lock lock{packet_mutex};
+ 
++    LOG_INFO(Service_LDN,
++             "CreateNetwork: state={}, security_mode={}, node_count_max={}, "
++             "local_communication_version={}",
++             static_cast<int>(state), security_config.security_mode,
++             network_config.node_count_max, network_config.local_communication_version);
++
+     if (state != State::AccessPointOpened) {
++        LOG_ERROR(Service_LDN, "CreateNetwork: bad state {}, expected AccessPointOpened(2)",
++                  static_cast<int>(state));
+         return ResultBadState;
+     }
+ 
+@@ -286,24 +297,37 @@ Result LANDiscovery::DestroyNetwork() {
+ Result LANDiscovery::Connect(const NetworkInfo& network_info_, const UserConfig& user_config,
+                              u16 local_communication_version) {
+     std::scoped_lock lock{packet_mutex};
++
++    LOG_INFO(Service_LDN,
++             "Connect: state={}, node_count={}, local_communication_version={}",
++             static_cast<int>(state), network_info_.ldn.node_count, local_communication_version);
++
+     if (network_info_.ldn.node_count == 0) {
++        LOG_ERROR(Service_LDN, "Connect: node_count is 0");
+         return ResultInvalidNodeCount;
+     }
+ 
+     Result rc = GetNodeInfo(node_info, user_config, local_communication_version);
+     if (rc.IsError()) {
++        LOG_ERROR(Service_LDN, "Connect: GetNodeInfo failed: 0x{:08X}", rc.raw);
+         return ResultConnectionFailed;
+     }
+ 
+     Ipv4Address node_host = network_info_.ldn.nodes[0].ipv4_address;
+     std::reverse(std::begin(node_host), std::end(node_host)); // htonl
+     host_ip = node_host;
++
++    LOG_INFO(Service_LDN, "Connect: sending Connect packet to host {}.{}.{}.{}",
++             (*host_ip)[0], (*host_ip)[1], (*host_ip)[2], (*host_ip)[3]);
++
+     SendPacket(Network::LDNPacketType::Connect, node_info, *host_ip);
+ 
+     InitNodeStateChange();
+ 
+     std::this_thread::sleep_for(std::chrono::seconds(1));
+ 
++    LOG_INFO(Service_LDN, "Connect: after wait, state={}", static_cast<int>(state));
++
+     return ResultSuccess;
+ }
+ 
+@@ -471,8 +495,18 @@ void LANDiscovery::SendBroadcast(Network::LDNPacketType type) {
+ void LANDiscovery::SendPacket(const Network::LDNPacket& packet) {
+     if (auto room_member = Network::GetRoomMember().lock()) {
+         if (room_member->IsConnected()) {
++            LOG_INFO(Service_LDN, "SendPacket: type={}, broadcast={}, local_ip={}.{}.{}.{}",
++                     static_cast<int>(packet.type), packet.broadcast, packet.local_ip[0],
++                     packet.local_ip[1], packet.local_ip[2], packet.local_ip[3]);
+             room_member->SendLdnPacket(packet);
++        } else {
++            LOG_WARNING(Service_LDN,
++                        "SendPacket: room_member not connected, dropping packet type={}",
++                        static_cast<int>(packet.type));
+         }
++    } else {
++        LOG_WARNING(Service_LDN, "SendPacket: no room_member, dropping packet type={}",
++                    static_cast<int>(packet.type));
+     }
+ }
+ 
+diff --git a/src/core/hle/service/ldn/user_local_communication_service.cpp b/src/core/hle/service/ldn/user_local_communication_service.cpp
+index 1e984a9782..038cc1b932 100644
+--- a/src/core/hle/service/ldn/user_local_communication_service.cpp
++++ b/src/core/hle/service/ldn/user_local_communication_service.cpp
+@@ -4,7 +4,9 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include <memory>
++#include <span>
+ 
++#include "common/hex_util.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_event.h"
+ #include "core/hle/service/cmif_serialization.h"
+@@ -90,9 +92,11 @@ Result IUserLocalCommunicationService::GetState(Out<State> out_state) {
+ 
+ Result IUserLocalCommunicationService::GetNetworkInfo(
+     OutLargeData<NetworkInfo, BufferAttr_HipcPointer> out_network_info) {
+-    LOG_INFO(Service_LDN, "called");
++    const auto result = lan_discovery.GetNetworkInfo(*out_network_info);
++    LOG_INFO(Service_LDN, "called, result=0x{:08X}, state={}", result.raw,
++             static_cast<int>(lan_discovery.GetState()));
+ 
+-    R_RETURN(lan_discovery.GetNetworkInfo(*out_network_info));
++    R_RETURN(result);
+ }
+ 
+ Result IUserLocalCommunicationService::GetIpv4Address(Out<Ipv4Address> out_current_address,
+@@ -213,7 +217,13 @@ Result IUserLocalCommunicationService::CloseAccessPoint() {
+ }
+ 
+ Result IUserLocalCommunicationService::CreateNetwork(const CreateNetworkConfig& create_config) {
+-    LOG_INFO(Service_LDN, "called");
++    const auto& sec = create_config.security_config;
++    const std::vector<u8> passphrase_vec(sec.passphrase.begin(),
++                                         sec.passphrase.begin() + sec.passphrase_size);
++    LOG_INFO(Service_LDN,
++             "called, passphrase_size={}, security_mode={}, passphrase={}",
++             sec.passphrase_size, sec.security_mode,
++             Common::HexToString(passphrase_vec));
+ 
+     R_RETURN(lan_discovery.CreateNetwork(create_config.security_config, create_config.user_config,
+                                          create_config.network_config));
+@@ -222,7 +232,13 @@ Result IUserLocalCommunicationService::CreateNetwork(const CreateNetworkConfig&
+ Result IUserLocalCommunicationService::CreateNetworkPrivate(
+     const CreateNetworkConfigPrivate& create_config,
+     InArray<AddressEntry, BufferAttr_HipcPointer> address_list) {
+-    LOG_INFO(Service_LDN, "called");
++    const auto& sec = create_config.security_config;
++    const std::vector<u8> passphrase_vec(sec.passphrase.begin(),
++                                         sec.passphrase.begin() + sec.passphrase_size);
++    LOG_INFO(Service_LDN,
++             "called, passphrase_size={}, security_mode={}, passphrase={}",
++             sec.passphrase_size, sec.security_mode,
++             Common::HexToString(passphrase_vec));
+ 
+     R_RETURN(lan_discovery.CreateNetwork(create_config.security_config, create_config.user_config,
+                                          create_config.network_config));
+@@ -266,11 +282,15 @@ Result IUserLocalCommunicationService::CloseStation() {
+ Result IUserLocalCommunicationService::Connect(
+     const ConnectNetworkData& connect_data,
+     InLargeData<NetworkInfo, BufferAttr_HipcPointer> network_info) {
++    const auto& sec = connect_data.security_config;
++    const std::vector<u8> passphrase_vec(sec.passphrase.begin(),
++                                         sec.passphrase.begin() + sec.passphrase_size);
+     LOG_INFO(Service_LDN,
+              "called, passphrase_size={}, security_mode={}, "
+-             "local_communication_version={}",
+-             connect_data.security_config.passphrase_size,
+-             connect_data.security_config.security_mode, connect_data.local_communication_version);
++             "local_communication_version={}, passphrase={}",
++             sec.passphrase_size, sec.security_mode,
++             connect_data.local_communication_version,
++             Common::HexToString(passphrase_vec));
+ 
+     R_RETURN(lan_discovery.Connect(*network_info, connect_data.user_config,
+                                    static_cast<u16>(connect_data.local_communication_version)));
+@@ -286,18 +306,24 @@ Result IUserLocalCommunicationService::Initialize(ClientProcessId aruid) {
+     LOG_INFO(Service_LDN, "called, process_id={}", aruid.pid);
+ 
+     const auto network_interface = Network::GetSelectedNetworkInterface();
++    if (!network_interface) {
++        LOG_ERROR(Service_LDN, "Initialize: no network interface selected");
++    }
+     R_UNLESS(network_interface, ResultAirplaneModeEnabled);
+ 
+     if (auto room_member = Network::GetRoomMember().lock()) {
++        LOG_INFO(Service_LDN, "Initialize: room_member connected={}",
++                 room_member->IsConnected());
+         ldn_packet_received = room_member->BindOnLdnPacketReceived(
+             [this](const Network::LDNPacket& packet) { OnLDNPacketReceived(packet); });
+     } else {
+-        LOG_ERROR(Service_LDN, "Couldn't bind callback!");
++        LOG_ERROR(Service_LDN, "Initialize: Couldn't bind callback - no room_member!");
+         R_RETURN(ResultAirplaneModeEnabled);
+     }
+ 
+     lan_discovery.Initialize([&]() { OnEventFired(); });
+     is_initialized = true;
++    LOG_INFO(Service_LDN, "Initialize: success");
+     R_SUCCEED();
+ }
+ 

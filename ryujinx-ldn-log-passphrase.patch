@@ -1,0 +1,53 @@
+# LDN Passphrase Logger
+#
+# Logs the game's LDN passphrase (SecurityConfig.Passphrase) when the game
+# calls CreateNetwork (IPC cmd 202/203) or Connect (IPC cmd 302/303).
+#
+# Based on: ryubing/ryujinx master @ 4ebc318da
+#
+# Usage:
+#   1. git clone https://git.ryujinx.app/ryubing/ryujinx.git && cd ryujinx
+#      (If HEAD has moved past 4ebc318da, verify the patch still applies cleanly: git apply --check ldn-log-passphrase.patch)
+#   2. git apply ldn-log-passphrase.patch
+#   3. dotnet build -c Release -o build
+#      (requires .NET 10.0 SDK, or: docker run --rm -v $PWD:/app -w /app mcr.microsoft.com/dotnet/sdk:10.0 dotnet build -c Release -o build)
+#   4. Launch a game and start the LDN hosting (in-game menu)
+#   5. Check the log for "[LDN Passphrase]" entries
+#
+# No opposite Switch/device is needed — the passphrase is captured at the
+# IPC boundary before any network operation occurs.
+#
+diff --git a/src/Ryujinx.HLE/HOS/Services/Ldn/UserServiceCreator/IUserLocalCommunicationService.cs b/src/Ryujinx.HLE/HOS/Services/Ldn/UserServiceCreator/IUserLocalCommunicationService.cs
+index 71d1623f3..b86b0a340 100644
+--- a/src/Ryujinx.HLE/HOS/Services/Ldn/UserServiceCreator/IUserLocalCommunicationService.cs
++++ b/src/Ryujinx.HLE/HOS/Services/Ldn/UserServiceCreator/IUserLocalCommunicationService.cs
+@@ -578,6 +578,7 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
+         public ResultCode CreateNetworkImpl(ServiceCtx context, bool isPrivate = false)
+         {
+             SecurityConfig securityConfig = context.RequestData.ReadStruct<SecurityConfig>();
++            LogPassphrase("CreateNetwork", securityConfig);
+             SecurityParameter securityParameter = isPrivate ? context.RequestData.ReadStruct<SecurityParameter>() : new SecurityParameter();
+ 
+             UserConfig userConfig = context.RequestData.ReadStruct<UserConfig>();
+@@ -863,6 +864,7 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
+         private ResultCode ConnectImpl(ServiceCtx context, bool isPrivate = false)
+         {
+             SecurityConfig securityConfig = context.RequestData.ReadStruct<SecurityConfig>();
++            LogPassphrase("Connect", securityConfig);
+             SecurityParameter securityParameter = isPrivate ? context.RequestData.ReadStruct<SecurityParameter>() : new SecurityParameter();
+ 
+             UserConfig userConfig = context.RequestData.ReadStruct<UserConfig>();
+@@ -1155,6 +1157,13 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
+             return resultCode;
+         }
+
++        private static void LogPassphrase(string caller, SecurityConfig securityConfig)
++        {
++            string hex = Convert.ToHexString(securityConfig.Passphrase.AsSpan()).ToLowerInvariant();
++            Logger.Info?.Print(LogClass.ServiceLdn,
++                $"[LDN Passphrase] {caller}: size={securityConfig.PassphraseSize} mode={securityConfig.SecurityMode} hex={hex}");
++        }
++
+         public void Dispose()
+         {
+             _station?.Dispose();
